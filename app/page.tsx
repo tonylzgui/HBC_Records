@@ -880,11 +880,6 @@ export default function Home() {
 
 
 
-
-
-
-
-
   function getSortedSuggestions(uid: string) {
   const arr = suggestionsByUid[uid] ? [...suggestionsByUid[uid]] : [];
   const mode = sortModeByUid[uid] ?? "top";
