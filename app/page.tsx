@@ -488,13 +488,13 @@ export default function Home() {
     // auth
     supabase.auth.getUser().then(({ data }) => {
       const u = data.user;
-      setUser(u ? { id: u.id, email: u.email } : null);
+      setUser(u ? { id: u.id, email: u.email ?? null } : null);
       if (u?.id) ensureProfileUsername(u.id, u.email);
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
       const u = session?.user;
-      setUser(u ? { id: u.id, email: u.email } : null);
+      setUser(u ? { id: u.id, email: u.email ?? null } : null);
       if (u?.id) ensureProfileUsername(u.id, u.email);
     });
 
