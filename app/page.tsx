@@ -1038,6 +1038,11 @@ export default function Home() {
         <div style={{ fontWeight: 900, fontSize: 18 }}>Hudson&apos;s Bay Company Records</div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          {isLoadingSuggestions ? (
+            <div style={{ fontSize: 12, opacity: 0.75, marginRight: 6, whiteSpace: "nowrap" }}>
+              Loading…
+            </div>
+          ) : null}
           {!user ? (
             <>
               <button
@@ -1143,9 +1148,6 @@ export default function Home() {
             zIndex: 1,
           }}
         >
-          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
-            {isLoadingSuggestions ? <span style={{ fontSize: 12, opacity: 0.7 }}>Loading suggestions…</span> : null}
-          </div>
           <div
             style={{
               display: "flex",
