@@ -50,18 +50,33 @@ function getAllLinesForPage(p: PageObj): LineWithUid[] {
   return out;
 }
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
 
 export default function Home() {
-  const PDF_URL = process.env.NEXT_PUBLIC_PDF_URL!;
-  const JSON_URL = process.env.NEXT_PUBLIC_JSON_URL!;
+  const PDF_URL = process.env.NEXT_PUBLIC_PDF_URL ?? "";
+  const JSON_URL = process.env.NEXT_PUBLIC_JSON_URL ?? "";
 
   // Supabase document id for this viewer
-  const DOCUMENT_ID = process.env.NEXT_PUBLIC_DOCUMENT_ID || "";
-  // Removed inline sign-in state.
+  const DOCUMENT_ID = process.env.NEXT_PUBLIC_DOCUMENT_ID ?? "";
+
+  const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
+  const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
+
+  const [fatalError, setFatalError] = useState<string | null>(null);
+
+  const missingEnv = useMemo(() => {
+    const missing: string[] = [];
+    if (!SUPABASE_URL) missing.push("NEXT_PUBLIC_SUPABASE_URL");
+    if (!SUPABASE_ANON_KEY) missing.push("NEXT_PUBLIC_SUPABASE_ANON_KEY");
+    if (!PDF_URL) missing.push("NEXT_PUBLIC_PDF_URL");
+    if (!JSON_URL) missing.push("NEXT_PUBLIC_JSON_URL");
+    if (!DOCUMENT_ID) missing.push("NEXT_PUBLIC_DOCUMENT_ID");
+    return missing;
+  }, [SUPABASE_URL, SUPABASE_ANON_KEY, PDF_URL, JSON_URL, DOCUMENT_ID]);
+
+  const supabase = useMemo(() => {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
+    return createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  }, [SUPABASE_URL, SUPABASE_ANON_KEY]);
 
   const [showSignup, setShowSignup] = useState(false);
   const [showSignin, setShowSignin] = useState(false);
@@ -117,6 +132,77 @@ export default function Home() {
   const [zoom, setZoom] = useState<number>(1);
   const [pdfViewportWidth, setPdfViewportWidth] = useState<number>(0);
 
+  // Prevent accidental modal close on click-drag: only close when user *clicks* the backdrop (no drag).
+  // Use pointer-capture so we reliably detect movement even if the pointer leaves the backdrop.
+  const backdropClickRef = useRef<{
+    down: boolean;
+    moved: boolean;
+    x: number;
+    y: number;
+    pointerId: number | null;
+  }>({
+    down: false,
+    moved: false,
+    x: 0,
+    y: 0,
+    pointerId: null,
+  });
+
+  function backdropHandlers(close: () => void) {
+    return {
+      onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+        // Only track gestures that START on the backdrop itself
+        if (e.target !== e.currentTarget) return;
+
+        backdropClickRef.current.down = true;
+        backdropClickRef.current.moved = false;
+        backdropClickRef.current.x = e.clientX;
+        backdropClickRef.current.y = e.clientY;
+        backdropClickRef.current.pointerId = e.pointerId;
+
+        // Capture the pointer so we still get move/up even if the pointer drifts off the backdrop
+        try {
+          (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+        } catch {}
+      },
+      onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+        if (!backdropClickRef.current.down) return;
+        const dx = Math.abs(e.clientX - backdropClickRef.current.x);
+        const dy = Math.abs(e.clientY - backdropClickRef.current.y);
+        if (dx > 6 || dy > 6) backdropClickRef.current.moved = true;
+      },
+      onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
+        const wasDown = backdropClickRef.current.down;
+        const moved = backdropClickRef.current.moved;
+        const pid = backdropClickRef.current.pointerId;
+
+        backdropClickRef.current.down = false;
+        backdropClickRef.current.moved = false;
+        backdropClickRef.current.pointerId = null;
+
+        // Release capture (best-effort)
+        try {
+          if (pid != null) (e.currentTarget as HTMLDivElement).releasePointerCapture(pid);
+        } catch {}
+
+        // Only close if:
+        // 1) the gesture started on the backdrop
+        // 2) the pointer did NOT move (no drag)
+        // 3) the pointer-up is on the backdrop itself
+        if (wasDown && !moved && e.target === e.currentTarget) close();
+      },
+      onPointerCancel: (e: React.PointerEvent<HTMLDivElement>) => {
+        const pid = backdropClickRef.current.pointerId;
+        backdropClickRef.current.down = false;
+        backdropClickRef.current.moved = false;
+        backdropClickRef.current.pointerId = null;
+        try {
+          if (pid != null) (e.currentTarget as HTMLDivElement).releasePointerCapture(pid);
+        } catch {}
+      },
+    };
+  }
+
   const pageKeys = useMemo(() => {
     if (!doc) return [];
 
@@ -149,6 +235,7 @@ export default function Home() {
   }, [pageKeys]);
 
   async function loadSuggestionsForPage(docId: string, pk: string) {
+    if (!supabase) return;
     if (!docId || !pk) return;
     setIsLoadingSuggestions(true);
     try {
@@ -243,6 +330,7 @@ export default function Home() {
 
   async function submitSuggestion(uid: string, originalText: string) {
     if (!user) return alert("Please sign in to suggest edits.");
+    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
     if (!DOCUMENT_ID) return alert("Missing NEXT_PUBLIC_DOCUMENT_ID in .env.local");
     if (!pageKey) return;
 
@@ -280,60 +368,61 @@ export default function Home() {
   }
 
   async function ensureProfileUsername(userId: string, fallbackEmail?: string | null) {
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, username")
-    .eq("id", userId)
-    .maybeSingle();
+    if (!supabase) return;
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, username")
+      .eq("id", userId)
+      .maybeSingle();
 
-  if (error) {
-    console.warn("profiles select failed", error);
-    return;
-  }
+    if (error) {
+      console.warn("profiles select failed", error);
+      return;
+    }
 
-  if (data?.username) {
-    setUsernameByUserId((prev) => ({ ...prev, [userId]: data.username }));
-    return;
-  }
+    if (data?.username) {
+      setUsernameByUserId((prev) => ({ ...prev, [userId]: data.username }));
+      return;
+    }
 
-  // No profile row (or username empty) -> create one using a fallback
-  const fallback =
-    (fallbackEmail?.split("@")[0] ?? "").trim() || `user_${userId.slice(0, 6)}`;
+    // No profile row (or username empty) -> create one using a fallback
+    const fallback =
+      (fallbackEmail?.split("@")[0] ?? "").trim() || `user_${userId.slice(0, 6)}`;
 
-  const { error: upsertErr } = await supabase
-    .from("profiles")
-    .upsert({ id: userId, username: fallback }, { onConflict: "id" });
+    const { error: upsertErr } = await supabase
+      .from("profiles")
+      .upsert({ id: userId, username: fallback }, { onConflict: "id" });
 
-  if (upsertErr) {
-    console.warn("profiles upsert failed", upsertErr);
-    return;
-  }
+    if (upsertErr) {
+      console.warn("profiles upsert failed", upsertErr);
+      return;
+    }
 
-  setUsernameByUserId((prev) => ({ ...prev, [userId]: fallback }));
+    setUsernameByUserId((prev) => ({ ...prev, [userId]: fallback }));
   }
 
   async function upvoteSuggestion(suggestionId: string) {
-  if (!user) return alert("Please sign in to vote.");
+    if (!user) return alert("Please sign in to vote.");
+    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
 
+    const { error } = await supabase
+      .from("suggestion_votes")
+      .upsert(
+        {
+          suggestion_id: suggestionId,
+          user_id: user.id,
+          vote: 1,
+        },
+        { onConflict: "suggestion_id,user_id" }
+      );
 
+    if (error) return alert(error.message);
 
-  const { error } = await supabase
-    .from("suggestion_votes")
-    .upsert(
-      {
-        suggestion_id: suggestionId,
-        user_id: user.id,
-        vote: 1,
-      },
-      { onConflict: "suggestion_id,user_id" }
-    );
-
-  if (error) return alert(error.message);
-
-  await loadSuggestionsForPage(DOCUMENT_ID, pageKey);
+    await loadSuggestionsForPage(DOCUMENT_ID, pageKey);
   }
 
   async function loadLeaderboard() {
+    if (!supabase) return;
     setIsLoadingLeaderboard(true);
     try {
       // Requires FK: suggestion_votes.suggestion_id -> suggestions.id
@@ -458,7 +547,10 @@ export default function Home() {
 
   useEffect(() => {
     (async () => {
-      if (!PDF_URL || !JSON_URL) throw new Error("Missing NEXT_PUBLIC_PDF_URL or NEXT_PUBLIC_JSON_URL");
+      if (!PDF_URL || !JSON_URL) {
+        setFatalError("Missing NEXT_PUBLIC_PDF_URL or NEXT_PUBLIC_JSON_URL. Set these in Vercel → Project → Settings → Environment Variables.");
+        return;
+      }
 
       const r = await fetch(JSON_URL);
       if (!r.ok) throw new Error(`JSON fetch failed: ${r.status}`);
@@ -480,11 +572,12 @@ export default function Home() {
       setPdf(loaded);
     })().catch(e => {
       console.error(e);
-      alert(e?.message || String(e));
+      setFatalError(e?.message || String(e));
     });
   }, [PDF_URL, JSON_URL]);
 
   useEffect(() => {
+    if (!supabase) return;
     // auth
     supabase.auth.getUser().then(({ data }) => {
       const u = data.user;
@@ -520,6 +613,7 @@ export default function Home() {
   }, []);
 
   async function signUp() {
+    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
     // If the user typed an email in the sign-in modal and signupEmail is empty, reuse it.
     if (!signupEmail.trim() && signinId.trim().includes("@")) {
       setSignupEmail(signinId.trim());
@@ -557,6 +651,7 @@ export default function Home() {
   }
 
   async function signIn() {
+    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
     const id = signinId.trim();
     if (!id) return alert("Enter your username or email.");
 
@@ -590,9 +685,11 @@ export default function Home() {
   }
 
   async function signOut() {
+    if (!supabase) return;
     await supabase.auth.signOut();
   }
   async function forgotPassword() {
+    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
     const raw = signinId.trim();
     if (!raw) return alert("Enter your email (or username) first.");
 
@@ -942,14 +1039,35 @@ export default function Home() {
   };
 
 
-  if (!doc) return <div style={{ padding: 16 }}>Loading…</div>;
-  if (!DOCUMENT_ID) {
+  if (missingEnv.length || !supabase) {
     return (
-      <div style={{ padding: 16 }}>
-        Missing <code>NEXT_PUBLIC_DOCUMENT_ID</code> in <code>.env.local</code>. Set it to the <code>documents.id</code> you ingested.
+      <div style={{ padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
+        <div style={{ fontWeight: 900, fontSize: 16 }}>Missing required environment variables</div>
+        <div style={{ marginTop: 8, opacity: 0.85 }}>
+          This deployment is missing one or more <code>NEXT_PUBLIC_*</code> variables. Add them in Vercel → Project → Settings → Environment Variables,
+          then redeploy.
+        </div>
+        <ul style={{ marginTop: 10 }}>
+          {missingEnv.map((k) => (
+            <li key={k}>
+              <code>{k}</code>
+            </li>
+          ))}
+        </ul>
       </div>
     );
   }
+
+  if (fatalError) {
+    return (
+      <div style={{ padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
+        <div style={{ fontWeight: 900, fontSize: 16 }}>Application error</div>
+        <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{fatalError}</div>
+      </div>
+    );
+  }
+
+  if (!doc) return <div style={{ padding: 16 }}>Loading…</div>;
 
   const lines = pageKey && doc[pageKey] ? getAllLinesForPage(doc[pageKey]) : [];
 
@@ -1018,44 +1136,6 @@ export default function Home() {
   loadLeaderboard();
   };
 
-  // Prevent accidental modal close on click-drag: only close when user clicks backdrop (no drag)
-  const backdropClickRef = useRef<{ down: boolean; moved: boolean; x: number; y: number }>({
-    down: false,
-    moved: false,
-    x: 0,
-    y: 0,
-  });
-
-  function backdropHandlers(close: () => void) {
-    return {
-      onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
-        // Only start tracking if the pointer down starts on the backdrop itself
-        if (e.target !== e.currentTarget) return;
-        backdropClickRef.current.down = true;
-        backdropClickRef.current.moved = false;
-        backdropClickRef.current.x = e.clientX;
-        backdropClickRef.current.y = e.clientY;
-      },
-      onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
-        if (!backdropClickRef.current.down) return;
-        const dx = Math.abs(e.clientX - backdropClickRef.current.x);
-        const dy = Math.abs(e.clientY - backdropClickRef.current.y);
-        if (dx > 4 || dy > 4) backdropClickRef.current.moved = true;
-      },
-      onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
-        const wasDown = backdropClickRef.current.down;
-        const moved = backdropClickRef.current.moved;
-        backdropClickRef.current.down = false;
-        backdropClickRef.current.moved = false;
-        // Only close if pointer started and ended on the backdrop and there was no drag
-        if (wasDown && !moved && e.target === e.currentTarget) close();
-      },
-      onPointerCancel: () => {
-        backdropClickRef.current.down = false;
-        backdropClickRef.current.moved = false;
-      },
-    };
-  }
 
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
@@ -1074,14 +1154,14 @@ export default function Home() {
           flex: "0 0 auto",
         }}
       >
-        <div style={{ fontWeight: 900, fontSize: 18 }}>Hudson&apos;s Bay Company Records</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ fontWeight: 900, fontSize: 18 }}>Hudson&apos;s Bay Company Records</div>
+          {isLoadingSuggestions ? (
+            <div style={{ fontSize: 12, opacity: 0.75, whiteSpace: "nowrap" }}>Loading…</div>
+          ) : null}
+        </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          {isLoadingSuggestions ? (
-            <div style={{ fontSize: 12, opacity: 0.75, marginRight: 6, whiteSpace: "nowrap" }}>
-              Loading…
-            </div>
-          ) : null}
           {!user ? (
             <>
               <button
@@ -1566,7 +1646,11 @@ export default function Home() {
           </div>
         ))}
       </div>
-      {/* LEADERBOARD MODAL OVERLAY */}
+
+           {/* Close the 2-panel grid before rendering overlays */}
+      </div>
+
+      {/* LEADERBOARD MODAL OVERLAY (does not affect layout) */}
       {showLeaderboard ? (
         <div
           {...backdropHandlers(() => setShowLeaderboard(false))}
@@ -1664,6 +1748,7 @@ export default function Home() {
           </div>
         </div>
       ) : null}
+
       {/* SIGNIN MODAL OVERLAY (does not affect layout) */}
       {!user && showSignin ? (
         <div
@@ -1735,19 +1820,11 @@ export default function Home() {
               <button
                 type="button"
                 onClick={signIn}
-                style={{
-                  padding: "9px 14px",
-                  borderRadius: 12,
-                  border: "1px solid rgba(0,0,0,0.18)",
-                  background: "white",
-                  cursor: "pointer",
-                  fontWeight: 900,
-                  boxShadow: "0 1px 2px rgba(0,0,0,0.10)",
-                  outline: "none",
-                  appearance: "none",
-                }}
+                style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
+                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
               >
                 Sign in
               </button>
@@ -1759,19 +1836,11 @@ export default function Home() {
                   if (signinId.trim().includes("@")) setSignupEmail(signinId.trim());
                   setShowSignup(true);
                 }}
-                style={{
-                  padding: "9px 14px",
-                  borderRadius: 12,
-                  border: "1px solid rgba(0,0,0,0.18)",
-                  background: "white",
-                  cursor: "pointer",
-                  fontWeight: 900,
-                  boxShadow: "0 1px 2px rgba(0,0,0,0.10)",
-                  outline: "none",
-                  appearance: "none",
-                }}
+                style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
+                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
               >
                 Create account
               </button>
@@ -1783,6 +1852,7 @@ export default function Home() {
           </div>
         </div>
       ) : null}
+
       {/* SIGNUP MODAL OVERLAY (does not affect layout) */}
       {!user && showSignup ? (
         <div
@@ -1882,14 +1952,11 @@ export default function Home() {
                 Cancel
               </button>
 
-              <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>
-                Username is shown publicly.
-              </div>
+              <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>Username is shown publicly.</div>
             </div>
           </div>
         </div>
       ) : null}
-      </div>
     </div>
   );
 }
