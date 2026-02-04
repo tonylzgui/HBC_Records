@@ -469,10 +469,10 @@ export default function Home() {
       setPageKey(firstValid);
 
       // Dynamically import pdf.js on the client only.
-      // Using the legacy build avoids `DOMMatrix is not defined` during server/module evaluation.
-      const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf");
+      // NOTE: importing the package root keeps TypeScript happy (the legacy subpath often has no .d.ts).
+      const pdfjsLib: any = await import("pdfjs-dist");
       pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-        "pdfjs-dist/legacy/build/pdf.worker.min.mjs",
+        "pdfjs-dist/build/pdf.worker.min.mjs",
         import.meta.url
       ).toString();
 
