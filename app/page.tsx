@@ -1018,6 +1018,45 @@ export default function Home() {
   loadLeaderboard();
   };
 
+  // Prevent accidental modal close on click-drag: only close when user clicks backdrop (no drag)
+  const backdropClickRef = useRef<{ down: boolean; moved: boolean; x: number; y: number }>({
+    down: false,
+    moved: false,
+    x: 0,
+    y: 0,
+  });
+
+  function backdropHandlers(close: () => void) {
+    return {
+      onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+        // Only start tracking if the pointer down starts on the backdrop itself
+        if (e.target !== e.currentTarget) return;
+        backdropClickRef.current.down = true;
+        backdropClickRef.current.moved = false;
+        backdropClickRef.current.x = e.clientX;
+        backdropClickRef.current.y = e.clientY;
+      },
+      onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+        if (!backdropClickRef.current.down) return;
+        const dx = Math.abs(e.clientX - backdropClickRef.current.x);
+        const dy = Math.abs(e.clientY - backdropClickRef.current.y);
+        if (dx > 4 || dy > 4) backdropClickRef.current.moved = true;
+      },
+      onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
+        const wasDown = backdropClickRef.current.down;
+        const moved = backdropClickRef.current.moved;
+        backdropClickRef.current.down = false;
+        backdropClickRef.current.moved = false;
+        // Only close if pointer started and ended on the backdrop and there was no drag
+        if (wasDown && !moved && e.target === e.currentTarget) close();
+      },
+      onPointerCancel: () => {
+        backdropClickRef.current.down = false;
+        backdropClickRef.current.moved = false;
+      },
+    };
+  }
+
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
       {/* Global header (does not scroll) */}
@@ -1530,7 +1569,7 @@ export default function Home() {
       {/* LEADERBOARD MODAL OVERLAY */}
       {showLeaderboard ? (
         <div
-          onClick={() => setShowLeaderboard(false)}
+          {...backdropHandlers(() => setShowLeaderboard(false))}
           style={{
             position: "fixed",
             inset: 0,
@@ -1628,7 +1667,7 @@ export default function Home() {
       {/* SIGNIN MODAL OVERLAY (does not affect layout) */}
       {!user && showSignin ? (
         <div
-          onClick={() => setShowSignin(false)}
+          {...backdropHandlers(() => setShowSignin(false))}
           style={{
             position: "fixed",
             inset: 0,
@@ -1747,7 +1786,7 @@ export default function Home() {
       {/* SIGNUP MODAL OVERLAY (does not affect layout) */}
       {!user && showSignup ? (
         <div
-          onClick={() => setShowSignup(false)}
+          {...backdropHandlers(() => setShowSignup(false))}
           style={{
             position: "fixed",
             inset: 0,
