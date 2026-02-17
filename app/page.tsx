@@ -19,7 +19,7 @@ type LineWithUid = Line & {
 type PageObj = {
   width: number;
   height: number;
-  paragraphs: { lines: Line[] }[];
+  paragraphs: { lines: Line[]; llm_text?: string | null }[];
 };
 type DocJson = Record<string, PageObj>;
 
@@ -34,6 +34,13 @@ type SuggestionRow = {
   created_at: string;
   vote_count?: number;
   author_username?: string | null; // snapshot stored on suggestion
+};
+
+type MapDoc = {
+  id: string;
+  title: string;
+  lat: number;
+  lng: number;
 };
 
 function pageKeyToNumber(pageKey: string) {
@@ -62,6 +69,45 @@ export default function Home() {
   const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
 
   const [fatalError, setFatalError] = useState<string | null>(null);
+  const [started, setStarted] = useState(false);
+  const [welcomeStats, setWelcomeStats] = useState<{ pages: number | null; lines: number | null; volunteers: number | null }>(
+    { pages: null, lines: null, volunteers: null }
+  );
+
+  const [transcriptionMode, setTranscriptionMode] = useState<"lines" | "paragraph">("lines");
+  const [activeParagraphId, setActiveParagraphId] = useState<string | null>(null);
+  const [paragraphItems, setParagraphItems] = useState<
+    Array<{ pid: string; text: string; box: { x: number; y: number; w: number; h: number } }>
+  >([]);
+
+  function normBoxFromPixels(
+  bbox: [number, number, number, number],
+  pageW: number,
+  pageH: number
+  ): { x: number; y: number; w: number; h: number; area: number } | null {
+    const [x1p, y1p, x2p, y2p] = bbox;
+    if (![x1p, y1p, x2p, y2p, pageW, pageH].every((v) => Number.isFinite(v))) return null;
+    if (pageW <= 0 || pageH <= 0) return null;
+
+    let x1n = x1p / pageW;
+    let x2n = x2p / pageW;
+    let y1n = y1p / pageH;
+    let y2n = y2p / pageH;
+
+    x1n = Math.min(1, Math.max(0, x1n));
+    x2n = Math.min(1, Math.max(0, x2n));
+    y1n = Math.min(1, Math.max(0, y1n));
+    y2n = Math.min(1, Math.max(0, y2n));
+
+    if (x2n < x1n) [x1n, x2n] = [x2n, x1n];
+    if (y2n < y1n) [y1n, y2n] = [y2n, y1n];
+
+    const w = Math.max(0, x2n - x1n);
+    const h = Math.max(0, y2n - y1n);
+    if (w <= 0 || h <= 0) return null;
+
+    return { x: x1n, y: y1n, w, h, area: w * h };
+  }
 
   const missingEnv = useMemo(() => {
     const missing: string[] = [];
@@ -107,6 +153,14 @@ export default function Home() {
   );
   const [isLoadingLeaderboard, setIsLoadingLeaderboard] = useState(false);
 
+  const [viewMode, setViewMode] = useState<"viewer" | "map">("viewer");
+  const [mapDocs, setMapDocs] = useState<MapDoc[]>([]);
+  const [isLoadingMap, setIsLoadingMap] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
+  const mapDivRef = useRef<HTMLDivElement | null>(null);
+  const leafletMapRef = useRef<any>(null);
+  const leafletLayerRef = useRef<any>(null);
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const hitSvgRef = useRef<SVGSVGElement | null>(null);
   const highlightSvgRef = useRef<SVGSVGElement | null>(null);
@@ -118,6 +172,7 @@ export default function Home() {
   const dragStartRef = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 });
 
   const lineElByIdRef = useRef<Record<string, HTMLDivElement | null>>({});
+  const paragraphElByIdRef = useRef<Record<string, HTMLDivElement | null>>({});
   const [activeSource, setActiveSource] = useState<"left" | "right" | null>(null);  
 
   const [doc, setDoc] = useState<DocJson | null>(null);
@@ -224,6 +279,28 @@ export default function Home() {
 
     // Otherwise, only show pages that exist in the JSON
     return Object.keys(doc).sort((a, b) => (pageKeyToNumber(a) ?? 0) - (pageKeyToNumber(b) ?? 0));
+  }, [doc, pdf]);
+
+  useEffect(() => {
+    // These stats are shown on the welcome page as soon as we have the JSON/PDF.
+    const pages = pdf?.numPages ?? (doc ? Object.keys(doc).filter((k) => pageKeyToNumber(k) != null).length : null);
+
+    let lines: number | null = null;
+    if (doc) {
+      let c = 0;
+      for (const k of Object.keys(doc)) {
+        const p = doc[k];
+        if (!p) continue;
+        c += getAllLinesForPage(p).length;
+      }
+      lines = c;
+    }
+
+    setWelcomeStats((prev) => ({
+      ...prev,
+      pages: typeof pages === "number" ? pages : prev.pages,
+      lines: typeof lines === "number" ? lines : prev.lines,
+    }));
   }, [doc, pdf]);
 
   useEffect(() => {
@@ -546,6 +623,13 @@ export default function Home() {
   };
 
   useEffect(() => {
+    // Allow deep-linking directly into the viewer
+    if (typeof window === "undefined") return;
+    const sp = new URLSearchParams(window.location.search);
+    if (sp.get("start") === "1") setStarted(true);
+  }, []);
+
+  useEffect(() => {
     (async () => {
       if (!PDF_URL || !JSON_URL) {
         setFatalError("Missing NEXT_PUBLIC_PDF_URL or NEXT_PUBLIC_JSON_URL. Set these in Vercel → Project → Settings → Environment Variables.");
@@ -723,6 +807,33 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [DOCUMENT_ID, pageKey]);
 
+  useEffect(() => {
+    if (!supabase) return;
+    if (!DOCUMENT_ID) return;
+
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from("suggestions")
+          .select("user_id")
+          .eq("document_id", DOCUMENT_ID)
+          .limit(10000);
+
+        if (error) throw error;
+
+        const uniq = new Set(
+          (data ?? [])
+            .map((r: any) => String(r?.user_id ?? "").trim())
+            .filter((x: string) => x.length > 0)
+        );
+
+        setWelcomeStats((prev) => ({ ...prev, volunteers: uniq.size }));
+      } catch (e) {
+        console.warn("welcome volunteers load failed", e);
+      }
+    })();
+  }, [supabase, DOCUMENT_ID]);
+
 
   useEffect(() => {
     const el = pdfScrollRef.current;
@@ -742,8 +853,84 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (viewMode !== "map") return;
+    if (typeof window === "undefined") return;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        await loadLeafletOnce();
+        if (cancelled) return;
+
+        // Load docs (markers)
+        const docs = await loadDocsForMap();
+        if (cancelled) return;
+
+        const L = (window as any).L;
+        const el = mapDivRef.current;
+        if (!L || !el) return;
+
+        // Init map once
+        if (!leafletMapRef.current) {
+          leafletMapRef.current = L.map(el, {
+            zoomControl: true,
+            attributionControl: true,
+          });
+
+          L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: "© OpenStreetMap contributors",
+          }).addTo(leafletMapRef.current);
+        }
+
+        // Refresh markers layer
+        if (leafletLayerRef.current) {
+          try {
+            leafletLayerRef.current.clearLayers();
+          } catch {}
+        } else {
+          leafletLayerRef.current = L.layerGroup().addTo(leafletMapRef.current);
+        }
+
+        // Add markers
+        for (const d of mapDocs) {
+          const m = L.marker([d.lat, d.lng]);
+          m.bindPopup(`<b>${String(d.title).replace(/</g, "&lt;")}</b>`);
+          m.addTo(leafletLayerRef.current);
+        }
+
+        if (docs.length) {
+          const b = L.latLngBounds(docs.map((d) => [d.lat, d.lng]));
+          leafletMapRef.current.fitBounds(b, { padding: [30, 30] });
+        } else {
+          leafletMapRef.current.setView([20, 0], 2);
+        }
+
+        // Fix sizing when switching views
+        setTimeout(() => {
+          try {
+            leafletMapRef.current?.invalidateSize?.();
+          } catch {}
+        }, 50);
+      } catch (e: any) {
+        console.warn("map init failed", e);
+        setMapError(e?.message || String(e));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // We intentionally exclude mapDocs from deps to avoid re-initting; marker refresh is handled by the button below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode]);
+
+  useEffect(() => {
     if (!doc || !pdf || !pageKey) return;
     let cancelled = false;
+
+    if (viewMode === "map") return;
 
     (async () => {
       const n = pageKeyToNumber(pageKey);
@@ -762,8 +949,11 @@ export default function Home() {
           }
         : null;
 
-      const canvas = canvasRef.current!;
-      const ctx = canvas.getContext("2d", { alpha: false })!;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) return;
 
       // Cancel any previous in-flight render on this same canvas (prevents pdf.js error)
       try {
@@ -811,7 +1001,9 @@ export default function Home() {
       // but we disable hit-testing/highlights for this page.
       if (!doc[pageKey]) {
         setHitBoxes([]);
+        setParagraphItems([]);
         setActiveId(null);
+        setActiveParagraphId(null);
         setActiveBox(null);
         return;
       }
@@ -873,6 +1065,50 @@ export default function Home() {
       nextHitBoxes.sort((a, b) => a.area - b.area);
       setHitBoxes(nextHitBoxes);
 
+
+
+      // Build paragraph-level boxes + text (for paragraph transcription mode)
+      const parItems: Array<{ pid: string; text: string; box: { x: number; y: number; w: number; h: number } }> = [];
+      const pars = pageObj?.paragraphs || [];
+      const pageW = pageObj!.width;
+      const pageH = pageObj!.height;
+
+      for (let pIdx = 0; pIdx < pars.length; pIdx++) {
+        const par: any = pars[pIdx];
+        const linesInPar: any[] = Array.isArray(par?.lines) ? par.lines : [];
+
+        let minX = 1, minY = 1, maxX = 0, maxY = 0;
+        let found = false;
+
+        for (const ln of linesInPar) {
+          const nb = normBoxFromPixels(ln.bbox, pageW, pageH);
+          if (!nb) continue;
+          found = true;
+          minX = Math.min(minX, nb.x);
+          minY = Math.min(minY, nb.y);
+          maxX = Math.max(maxX, nb.x + nb.w);
+          maxY = Math.max(maxY, nb.y + nb.h);
+        }
+
+        if (!found) continue;
+
+        minX = Math.min(1, Math.max(0, minX));
+        minY = Math.min(1, Math.max(0, minY));
+        maxX = Math.min(1, Math.max(0, maxX));
+        maxY = Math.min(1, Math.max(0, maxY));
+
+        const box = { x: minX, y: minY, w: Math.max(0, maxX - minX), h: Math.max(0, maxY - minY) };
+        if (box.w <= 0 || box.h <= 0) continue;
+
+        const llmText = (par?.llm_text ?? "").toString().trim();
+        const fallbackText = (linesInPar || []).map((x: any) => String(x?.transcription ?? "")).join("\n").trim();
+        const text = llmText || fallbackText;
+
+        parItems.push({ pid: `p-${pIdx}`, text, box });
+      }
+
+      setParagraphItems(parItems);
+
       if (scroller && prevScroll) {
         requestAnimationFrame(() => {
           const newW = scroller.scrollWidth || 1;
@@ -895,41 +1131,51 @@ export default function Home() {
         renderTaskRef.current?.cancel?.();
       } catch {}
     };
-  }, [doc, pdf, pageKey, zoom, pdfViewportWidth]);
+  }, [doc, pdf, pageKey, zoom, pdfViewportWidth, viewMode]);
+
 
   useEffect(() => {
-    if (!activeId) return;
+    if (!activeParagraphId) return;
     if (activeSource !== "left") return;
 
-    const lineEl = lineElByIdRef.current[String(activeId)];
+    const el = paragraphElByIdRef.current[String(activeParagraphId)];
     const container = rightScrollRef.current;
-    if (!lineEl || !container) return;
+    if (!el || !container) return;
 
     const containerRect = container.getBoundingClientRect();
-    const lineRect = lineEl.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
 
-    // line's top relative to the scroll container viewport
-    const offsetTop = lineRect.top - containerRect.top;
+    const offsetTop = elRect.top - containerRect.top;
 
     const targetTop =
       container.scrollTop +
       offsetTop -
       container.clientHeight / 2 +
-      lineEl.clientHeight / 2;
+      el.clientHeight / 2;
 
     container.scrollTo({ top: targetTop, behavior: "smooth" });
-  }, [activeId, activeSource]);
+  }, [activeParagraphId, activeSource]);
 
   // ------------------------------
   // Point-based hit-testing (PDF image -> transcript)
   // ------------------------------
-  function pickBoxAt(u: number, v: number) {
-    // u,v are normalized [0,1] coordinates within the rendered page
-    // hitBoxes are sorted by area asc, so the first match is the most specific.
+  function pickLineBoxAt(u: number, v: number) {
     for (const b of hitBoxes) {
       if (u >= b.x && u <= b.x + b.w && v >= b.y && v <= b.y + b.h) return b;
     }
     return null;
+  }
+
+  function pickParagraphAt(u: number, v: number) {
+    let best: { pid: string; box: { x: number; y: number; w: number; h: number }; area: number } | null = null;
+    for (const p of paragraphItems) {
+      const b = p.box;
+      if (u >= b.x && u <= b.x + b.w && v >= b.y && v <= b.y + b.h) {
+        const area = b.w * b.h;
+        if (!best || area < best.area) best = { pid: p.pid, box: b, area };
+      }
+    }
+    return best;
   }
 
   const onHitSvgClick: MouseEventHandler<SVGSVGElement> = (e) => {
@@ -948,26 +1194,53 @@ export default function Home() {
     const uu = Math.min(1, Math.max(0, u));
     const vv = Math.min(1, Math.max(0, v));
 
-    const picked = pickBoxAt(uu, vv);
+    // Paragraph mode: click toggles collapse for that paragraph id
+    if (transcriptionMode === "paragraph") {
+      const pickedP = pickParagraphAt(uu, vv);
+      if (!pickedP) return;
+
+      const pid = pickedP.pid;
+      const wasSame = activeParagraphId === pid;
+
+      setActiveSource("left");
+      setActiveParagraphId(pid);
+      setActiveId(null);
+      setActiveBox(pickedP.box);
+
+      // Click again toggles collapse for that paragraph’s suggestions (same behavior as line mode)
+      setCollapsedUid((prev) => {
+        const cur = !!prev[pid];
+        if (!wasSame) return { ...prev, [pid]: false };
+        return { ...prev, [pid]: cur ? false : true };
+      });
+
+      // Ensure community suggestions are visible when interacting
+      setCollapseSuggestions(false);
+
+      // Don’t auto-open suggest-edit on click
+      setOpenSuggestUid(null);
+      return;
+    }
+
+    // Line mode
+    const picked = pickLineBoxAt(uu, vv);
     if (!picked) return;
 
     const uid = picked.uid;
-
-    // Add: check if user clicked the same bbox as before
     const wasSame = activeId === uid;
 
-    // Highlight + scroll the matching line on the right
     setActiveSource("left");
     setActiveId(uid);
+    setActiveParagraphId(null);
     setActiveBox(boxByUidRef.current[uid] ?? null);
 
     // Ensure community suggestions are visible
     setCollapseSuggestions(false);
 
+    // Click again toggles collapse for that line’s suggestions
     setCollapsedUid((prev) => {
       const cur = !!prev[uid];
       if (!wasSame) return { ...prev, [uid]: false };
-      // Same bbox clicked again -> toggle
       return { ...prev, [uid]: cur ? false : true };
     });
 
@@ -1016,13 +1289,30 @@ export default function Home() {
       const uu = Math.min(1, Math.max(0, pt.x));
       const vv = Math.min(1, Math.max(0, pt.y));
 
-      const picked = pickBoxAt(uu, vv);
+      // Ignore hover updates while drag-panning
+      if (isDraggingRef.current) return;
+
+      if (transcriptionMode === "paragraph") {
+        const pickedP = pickParagraphAt(uu, vv);
+        if (!pickedP) return;
+
+        if (activeParagraphId === pickedP.pid && activeSource === "left") return;
+
+        setActiveSource("left");
+        setActiveParagraphId(pickedP.pid);
+        setActiveId(null);
+        setActiveBox(pickedP.box);
+        return;
+      }
+
+      const picked = pickLineBoxAt(uu, vv);
       if (!picked) return;
 
       if (activeId === picked.uid && activeSource === "left") return;
 
       setActiveSource("left");
       setActiveId(picked.uid);
+      setActiveParagraphId(null);
       setActiveBox(boxByUidRef.current[picked.uid] ?? null);
     });
   };
@@ -1035,11 +1325,12 @@ export default function Home() {
     }
     setActiveSource(null);
     setActiveId(null);
+    setActiveParagraphId(null);
     setActiveBox(null);
   };
 
 
-  if (missingEnv.length || !supabase) {
+  if (started && (missingEnv.length || !supabase)) {
     return (
       <div style={{ padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
         <div style={{ fontWeight: 900, fontSize: 16 }}>Missing required environment variables</div>
@@ -1058,11 +1349,174 @@ export default function Home() {
     );
   }
 
-  if (fatalError) {
+  if (started && fatalError) {
     return (
       <div style={{ padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
         <div style={{ fontWeight: 900, fontSize: 16 }}>Application error</div>
         <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{fatalError}</div>
+      </div>
+    );
+  }
+
+  // ------------------------------
+  // Welcome / landing screen
+  // ------------------------------
+  if (!started) {
+    const bgUrl = "/welcome-bg.png";
+
+    return (
+      <div
+        style={{
+          height: "100vh",
+          width: "100vw",
+          position: "relative",
+          overflow: "hidden",
+          fontFamily: "ui-sans-serif, system-ui",
+          color: "white",
+          background: bgUrl
+            ? `url(${bgUrl}) center/cover no-repeat`
+            : "radial-gradient(1200px 600px at 50% 15%, rgba(255,255,255,0.12), rgba(0,0,0,0)), linear-gradient(135deg, #2b2b2b 0%, #0f0f0f 100%)",
+        }}
+      >
+        {/* dark overlay for readability */}
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            background:
+              "linear-gradient(to bottom, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.35) 35%, rgba(0,0,0,0.65) 100%)",
+          }}
+        />
+
+        <div
+          style={{
+            position: "relative",
+            height: "100%",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 24,
+            textAlign: "center",
+          }}
+        >
+          <div
+            style={{
+              maxWidth: 780,
+              width: "100%",
+            }}
+          >
+            <div
+              style={{
+                fontWeight: 900,
+                letterSpacing: 0.2,
+                fontSize: 56,
+                lineHeight: 1.05,
+                textShadow: "0 3px 12px rgba(0,0,0,0.55)",
+              }}
+            >
+              Voices from The Past
+            </div>
+
+            <div
+              style={{
+                marginTop: 16,
+                fontSize: 16,
+                lineHeight: 1.5,
+                opacity: 0.95,
+                textShadow: "0 2px 10px rgba(0,0,0,0.45)",
+              }}
+            >
+              Help transcribe HBC Records.
+              <br />
+              Every word you transcribe brings a piece of history back to life.
+            </div>
+
+            <div style={{ marginTop: 22, display: "flex", justifyContent: "center" }}>
+              <button
+                type="button"
+                onClick={() => setStarted(true)}
+                disabled={missingEnv.length > 0}
+                title={
+                  missingEnv.length
+                    ? `Missing env vars: ${missingEnv.join(", ")}. Add them in .env.local or Vercel before starting.`
+                    : ""
+                }
+                style={{
+                  border: "1px solid rgba(255,255,255,0.28)",
+                  background: "rgba(255,255,255,0.14)",
+                  color: "white",
+                  padding: "12px 18px",
+                  borderRadius: 14,
+                  fontWeight: 900,
+                  cursor: missingEnv.length ? "not-allowed" : "pointer",
+                  boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+                  backdropFilter: "blur(6px)",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 10,
+                  fontSize: 16,
+                  opacity: missingEnv.length ? 0.6 : 1,
+                }}
+              >
+                <span
+                  aria-hidden="true"
+                  style={{
+                    width: 28,
+                    height: 28,
+                    borderRadius: 999,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: "rgba(255,255,255,0.18)",
+                    border: "1px solid rgba(255,255,255,0.28)",
+                  }}
+                >
+                  ➤
+                </span>
+                Start Transcribing
+              </button>
+            </div>
+
+            <div
+              style={{
+                marginTop: 26,
+                display: "grid",
+                gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                gap: 10,
+              }}
+            >
+              {[
+                {
+                  big: typeof welcomeStats.pages === "number" ? welcomeStats.pages.toLocaleString() : "—",
+                  small: "Pages Available",
+                },
+                {
+                  big: typeof welcomeStats.lines === "number" ? welcomeStats.lines.toLocaleString() : "—",
+                  small: "Lines Available",
+                },
+                {
+                  big: typeof welcomeStats.volunteers === "number" ? welcomeStats.volunteers.toLocaleString() : "—",
+                  small: "Active Volunteers",
+                },
+              ].map((s) => (
+                <div
+                  key={s.small}
+                  style={{
+                    border: "1px solid rgba(255,255,255,0.22)",
+                    background: "rgba(0,0,0,0.25)",
+                    borderRadius: 14,
+                    padding: "12px 14px",
+                    backdropFilter: "blur(6px)",
+                  }}
+                >
+                  <div style={{ fontWeight: 900, fontSize: 22, lineHeight: 1.1 }}>{s.big}</div>
+                  <div style={{ fontSize: 12, opacity: 0.92, marginTop: 4 }}>{s.small}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
     );
   }
@@ -1109,6 +1563,24 @@ export default function Home() {
     fontWeight: 800,
   };
 
+  const iconBtn: React.CSSProperties = {
+    border: "none",
+    background: "transparent",
+    padding: 6,
+    borderRadius: 10,
+    cursor: "pointer",
+    lineHeight: 0,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    color: "rgba(0,0,0,0.65)",
+    transition: "transform 120ms ease, background 120ms ease",
+    outline: "none",
+    appearance: "none",
+    userSelect: "none",
+    WebkitTapHighlightColor: "transparent",
+  };
+
   const btnLink: React.CSSProperties = {
     padding: 0,
     border: "none",
@@ -1132,9 +1604,125 @@ export default function Home() {
   };
 
   const openLeaderboard = () => {
-  setShowLeaderboard(true);
-  loadLeaderboard();
+    setShowLeaderboard(true);
+    loadLeaderboard();
   };
+
+  async function loadLeafletOnce() {
+    if (typeof window === "undefined") return;
+    // already loaded
+    if ((window as any).L) return;
+
+    // CSS
+    const cssId = "leaflet-css";
+    if (!document.getElementById(cssId)) {
+      const link = document.createElement("link");
+      link.id = cssId;
+      link.rel = "stylesheet";
+      link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+      document.head.appendChild(link);
+    }
+
+    // JS
+    await new Promise<void>((resolve, reject) => {
+      const jsId = "leaflet-js";
+      if (document.getElementById(jsId)) {
+        // script tag exists; wait a tick for L
+        const t = window.setInterval(() => {
+          if ((window as any).L) {
+            window.clearInterval(t);
+            resolve();
+          }
+        }, 50);
+        window.setTimeout(() => {
+          window.clearInterval(t);
+          if ((window as any).L) resolve();
+          else reject(new Error("Leaflet failed to load"));
+        }, 4000);
+        return;
+      }
+
+      const script = document.createElement("script");
+      script.id = jsId;
+      script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+      script.async = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Leaflet failed to load"));
+      document.body.appendChild(script);
+    });
+  }
+
+  async function loadDocsForMap(): Promise<MapDoc[]> {
+    if (!supabase) return [];
+    setIsLoadingMap(true);
+    setMapError(null);
+
+    try {
+      const { data, error } = await supabase
+        .from("documents")
+        .select("id,title,lat,lng")
+        .limit(5000);
+
+      if (error) throw error;
+
+      const rows = (data ?? []) as any[];
+      const docs: MapDoc[] = rows
+        .map((r) => ({
+          id: String(r?.id ?? ""),
+          title: String(r?.title ?? "").trim() || "(Untitled)",
+          lat: Number(r?.lat),
+          lng: Number(r?.lng),
+        }))
+        .filter((d) => d.id && Number.isFinite(d.lat) && Number.isFinite(d.lng));
+
+      setMapDocs(docs);
+      return docs;
+    } catch (e: any) {
+      console.warn("map docs load failed", e);
+      const msg = e?.message || String(e);
+
+      if (/column\s+documents\.(lat|lng)\s+does\s+not\s+exist/i.test(msg)) {
+        setMapError(
+          "Map locations aren’t configured yet. Add nullable `lat` and `lng` columns to the `documents` table, then reload."
+        );
+      } else {
+        setMapError(msg);
+      }
+
+      setMapDocs([]);
+      return [];
+    } finally {
+      setIsLoadingMap(false);
+    }
+  }
+
+  // Inline SVG pencil icon for "Suggest edit" buttons
+  function PencilGlyph({ size = 16 }: { size?: number }) {
+    return (
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+        aria-hidden="true"
+        focusable="false"
+      >
+        <path
+          d="M12 20h9"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+        <path
+          d="M16.5 3.5a2.121 2.121 0 0 1 3 3L8 18l-4 1 1-4 11.5-11.5Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinejoin="round"
+        />
+      </svg>
+    );
+  }
 
 
   return (
@@ -1165,16 +1753,28 @@ export default function Home() {
           {!user ? (
             <>
               <button
-              type="button"
-              onClick={openLeaderboard}
-              style={btnBase}
-              onMouseDown={preventMouseDownFocus}
-              onFocus={blurOnFocus}
-              onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-              onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
-            >
-              Community Leaderboard
-            </button>
+                type="button"
+                onClick={openLeaderboard}
+                style={btnBase}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+              >
+                Community Leaderboard
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setViewMode((m) => (m === "map" ? "viewer" : "map"))}
+                style={btnBase}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+              >
+                {viewMode === "map" ? "Back to Viewer" : "Map"}
+              </button>
 
               <button
                 type="button"
@@ -1220,6 +1820,18 @@ export default function Home() {
 
               <button
                 type="button"
+                onClick={() => setViewMode((m) => (m === "map" ? "viewer" : "map"))}
+                style={btnBase}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+              >
+                {viewMode === "map" ? "Back to Viewer" : "Map"}
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setCollapseSuggestions((v) => !v)}
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
@@ -1246,8 +1858,49 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Main two-panel layout */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", flex: 1, minHeight: 0 }}>
+      {/* Main content (viewer or map) */}
+      {viewMode === "map" ? (
+        <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+          <div
+            style={{
+              padding: 12,
+              borderBottom: "1px solid #e6e6e6",
+              background: "white",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontWeight: 900, fontSize: 14, opacity: 0.85 }}>Document Map</div>
+          </div>
+
+          {mapError ? (
+            <div style={{ padding: 12, color: "#b00020", fontFamily: "ui-sans-serif, system-ui" }}>
+              {mapError}
+            </div>
+          ) : null}
+
+          {isLoadingMap ? (
+            <div style={{ padding: 12, opacity: 0.75, fontFamily: "ui-sans-serif, system-ui" }}>Loading map…</div>
+          ) : null}
+
+          <div
+            ref={mapDivRef}
+            style={{
+              flex: 1,
+              minHeight: 0,
+              width: "100%",
+            }}
+          />
+
+          <div style={{ padding: 10, borderTop: "1px solid #e6e6e6", fontSize: 12, opacity: 0.8 }}>
+            Showing {mapDocs.length.toLocaleString()} documents with locations.
+          </div>
+        </div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", flex: 1, minHeight: 0 }}>
       <div
         style={{
           borderRight: "1px solid #e6e6e6",
@@ -1373,282 +2026,638 @@ export default function Home() {
         </div>
       </div>
 
-      <div ref={rightScrollRef} style={{ padding: 12, overflow: "auto", minHeight: 0, fontSize: 15 }}>
-        {lines.map((l) => (
-          <div
-            key={l.uid}
-            ref={(el) => {
-              lineElByIdRef.current[String(l.uid)] = el;
-            }}
-            onMouseEnter={() => {
-              setActiveSource("right");
-              setActiveId(l.uid);
-              setActiveBox(boxByUidRef.current[l.uid] ?? null);
-            }}
-            onMouseLeave={() => {
-              setActiveSource(null);
-              setActiveId(null);
-              setActiveBox(null);
-            }}
-            onClick={() => {
-              setActiveSource("right");
-              setActiveId(l.uid);
-              setActiveBox(boxByUidRef.current[l.uid] ?? null);
-            }}
-            style={{
-              padding: "8px 10px",
-              borderRadius: 10,
-              lineHeight: 1.35,
-              fontSize: 16,
-              marginBottom: 6,
-              cursor: "pointer",
-              border: "1px solid rgba(0,0,0,0.06)",
-              background: activeId === l.uid ? "rgba(255,242,168,0.75)" : "transparent",
-            }}
-          >
-            <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-              <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>{l.transcription}</div>
+      <div ref={rightScrollRef} style={{ padding: 12, overflow: "auto", minHeight: 0 }}>
+        {/* Sticky transcription mode toggle */}
+        <div style={{ position: "sticky", top: 0, background: "white", paddingBottom: 10, zIndex: 2 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+            <div style={{ fontWeight: 900, fontSize: 14, opacity: 0.8 }}>Transcription Source</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <button
                 type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (openSuggestUid === l.uid) {
-                    setOpenSuggestUid(null);
-                    setSuggestText("");
-                    setSuggestComment("");
-                  } else {
-                    setOpenSuggestUid(l.uid);
-                    setSuggestText(l.transcription);
-                    setSuggestComment("");
-                  }
+                onClick={() => setTranscriptionMode("lines")}
+                aria-pressed={transcriptionMode === "lines"}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  background: transcriptionMode === "lines" ? "rgba(0,0,0,0.08)" : "transparent",
+                  fontWeight: 800,
+                  cursor: "pointer",
+                  outline: "none",
                 }}
-                style={btnTiny}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
               >
-                Suggest Edit
+                By Line
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setTranscriptionMode("paragraph")}
+                aria-pressed={transcriptionMode === "paragraph"}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  background: transcriptionMode === "paragraph" ? "rgba(0,0,0,0.08)" : "transparent",
+                  fontWeight: 800,
+                  cursor: "pointer",
+                  outline: "none",
+                }}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+              >
+                By Paragraph
               </button>
             </div>
+          </div>
+        </div>
 
-            {openSuggestUid === l.uid ? (
-              <div style={{ marginTop: 8 }} onClick={(e) => e.stopPropagation()}>
-                <textarea
-                  value={suggestText}
-                  onChange={(e) => setSuggestText(e.target.value)}
-                  rows={3}
-                  style={{ width: "100%", padding: 8, borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)" }}
-                />
-                <textarea
-                  value={suggestComment}
-                  onChange={(e) => setSuggestComment(e.target.value)}
-                  rows={2}
-                  placeholder="Optional note (why this edit?)"
-                  style={{
-                    width: "100%",
-                    padding: 8,
-                    borderRadius: 10,
-                    border: "1px solid rgba(0,0,0,0.15)",
-                    marginTop: 8,
-                  }}
-                />
-                <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
-                  <button
-                    type="button"
-                    onClick={() => submitSuggestion(l.uid, l.transcription)}
-                    style={btnBase}
-                    onMouseDown={preventMouseDownFocus}
-                    onFocus={blurOnFocus}
-                    onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                    onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
-                  >
-                    Submit
-                  </button>
-
-                  <button
-                    type="button"
+        {transcriptionMode === "paragraph" ? (
+          paragraphItems.length ? (
+            <div style={{ display: "grid", gap: 10, fontSize: 16 }}>
+              {paragraphItems.map((p) => {
+                const isActive = activeParagraphId === p.pid;
+                return (
+                  <div
+                    key={p.pid}
+                    ref={(el) => {
+                      paragraphElByIdRef.current[String(p.pid)] = el;
+                    }}
+                    onMouseEnter={() => {
+                      setActiveSource("right");
+                      setActiveParagraphId(p.pid);
+                      setActiveId(null);
+                      setActiveBox(p.box);
+                    }}
+                    onMouseLeave={() => {
+                      setActiveSource(null);
+                      setActiveParagraphId(null);
+                      setActiveBox(null);
+                    }}
                     onClick={() => {
-                      setOpenSuggestUid(null);
-                      setSuggestText("");
-                      setSuggestComment("");
+                      setActiveSource("right");
+                      setActiveParagraphId(p.pid);
+                      setActiveId(null);
+                      setActiveBox(p.box);
                     }}
-                    style={btnBase}
-                    onMouseDown={preventMouseDownFocus}
-                    onFocus={blurOnFocus}
-                    onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                    onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
-                  >
-                    Cancel
-                  </button>
-
-                  {!user ? <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>Sign in to submit.</div> : null}
-                </div>
-
-                {/* Divider so the live suggestions below are clearly separated */}
-                <div style={{ height: 2, background: "rgba(0,0,0,0.18)", marginTop: 12 }} />
-              </div>
-            ) : null}
-
-            {!collapseSuggestions && suggestionsByUid[l.uid]?.length ? (
-              <div style={{ marginTop: 10, fontSize: 14 }} onClick={(e) => e.stopPropagation()}>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: 10,
-                    marginBottom: 6,
-                  }}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setCollapsedUid((prev) => ({ ...prev, [l.uid]: !prev[l.uid] }))}
                     style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 8,
-                      fontWeight: 800,
-                      padding: "6px 10px",
+                      padding: "10px 6px",
                       borderRadius: 10,
-                      border: "1px solid rgba(0,0,0,0.12)",
-                      background: "white",
+                      lineHeight: 1.35,
                       cursor: "pointer",
-                      boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
-                      outline: "none",
-                      appearance: "none",
+                      border: "1px solid rgba(0,0,0,0.06)",
+                      background: isActive ? "rgba(255,242,168,0.75)" : "transparent",
+                      boxShadow: "none",
+                      fontFamily: "Georgia, 'Times New Roman', serif",
+                      fontSize: 15,
                     }}
-                    onMouseDown={preventMouseDownFocus}
-                    onFocus={blurOnFocus}
                   >
-                    <span>Suggestions</span>
-                    <span style={{ fontSize: 12, opacity: 0.8 }}>{collapsedUid[l.uid] ? "▸" : "▾"}</span>
-                    <span style={{ fontSize: 12, opacity: 0.65 }}>({suggestionsByUid[l.uid].length})</span>
-                  </button>
-
-                  <div style={{ display: "flex", alignItems: "center" }}>
-                    <select
-                      aria-label="Sort suggestions"
-                      value={sortModeByUid[l.uid] ?? "top"}
-                      onChange={(e) =>
-                        setSortModeByUid((prev) => ({
-                          ...prev,
-                          [l.uid]: e.target.value as "top" | "newest",
-                        }))
-                      }
-                      style={{
-                        padding: "6px 10px",
-                        borderRadius: 10,
-                        border: "1px solid rgba(0,0,0,0.12)",
-                        background: "white",
-                        fontSize: 12,
-                        fontWeight: 800,
-                        outline: "none",
-                        cursor: "pointer",
-                      }}
-                    >
-                      <option value="top">Upvotes</option>
-                      <option value="newest">Newest</option>
-                    </select>
-                  </div>
-                </div>
-
-                {!collapsedUid[l.uid] &&
-                  getSortedSuggestions(l.uid)
-                    .slice(0, 5)
-                    .map((s) => (
-                      <div
-                        key={s.id}
-                        style={{
-                          padding: "6px 8px",
-                          border: "1px solid rgba(0,0,0,0.10)",
-                          borderRadius: 10,
-                          marginBottom: 6,
-                          fontSize: 14,
-                          background: "rgba(255,255,255,0.75)",
+                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                      <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>{p.text}</div>
+                      <button
+                        type="button"
+                        aria-label="Suggest edit"
+                        title="Suggest edit"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (openSuggestUid === p.pid) {
+                            setOpenSuggestUid(null);
+                            setSuggestText("");
+                            setSuggestComment("");
+                          } else {
+                            setOpenSuggestUid(p.pid);
+                            setSuggestText(p.text);
+                            setSuggestComment("");
+                          }
+                        }}
+                        style={iconBtn}
+                        onMouseDown={preventMouseDownFocus}
+                        onFocus={blurOnFocus}
+                        onMouseEnter={(e) => {
+                          (e.currentTarget as HTMLButtonElement).style.background = "rgba(0,0,0,0.06)";
+                          (e.currentTarget as HTMLButtonElement).style.transform = "translateY(1px)";
+                        }}
+                        onMouseLeave={(e) => {
+                          (e.currentTarget as HTMLButtonElement).style.background = "transparent";
+                          (e.currentTarget as HTMLButtonElement).style.transform = "translateY(0px)";
                         }}
                       >
-                        {/* Row 1: suggestion text (left) + vote count (right) */}
-                        <div
-                          style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "flex-start",
-                            gap: 10,
-                          }}
-                        >
-                          <div style={{ whiteSpace: "pre-wrap", flex: 1 }}>{s.suggested_text}</div>
-                          <div style={{ fontSize: 13, opacity: 0.85, whiteSpace: "nowrap" }}>▲ {s.vote_count ?? 0}</div>
-                        </div>
+                        <PencilGlyph size={16} />
+                      </button>
+                    </div>
 
-                        {/* Optional note */}
-                        {s.comment ? (
-                          <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
-                            <span style={{ fontWeight: 700 }}>Note:</span> {s.comment}
-                          </div>
-                        ) : null}
-
-                        {/* Row 2: by/date (left) + upvote button (right) */}
-                        <div
+                    {openSuggestUid === p.pid ? (
+                      <div style={{ marginTop: 10 }} onClick={(e) => e.stopPropagation()}>
+                        <textarea
+                          value={suggestText}
+                          onChange={(e) => setSuggestText(e.target.value)}
+                          rows={4}
+                          style={{ width: "100%", padding: 8, borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)" }}
+                        />
+                        <textarea
+                          value={suggestComment}
+                          onChange={(e) => setSuggestComment(e.target.value)}
+                          rows={2}
+                          placeholder="Optional note (why this edit?)"
                           style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "center",
-                            gap: 10,
+                            width: "100%",
+                            padding: 8,
+                            borderRadius: 10,
+                            border: "1px solid rgba(0,0,0,0.15)",
                             marginTop: 8,
                           }}
-                        >
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ fontSize: 13, opacity: 0.75, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              by {s.author_username || usernameByUserId[s.user_id] || `user:${s.user_id.slice(0, 8)}`} • {new Date(
-                                s.created_at
-                              ).toLocaleString()}
-                            </div>
-                            {!user ? (
-                              <div style={{ marginTop: 4, fontSize: 12, opacity: 0.8 }}>Sign in to vote.</div>
-                            ) : null}
-                          </div>
+                        />
+                        <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
+                          <button
+                            type="button"
+                            onClick={() => submitSuggestion(p.pid, p.text)}
+                            style={btnBase}
+                            onMouseDown={preventMouseDownFocus}
+                            onFocus={blurOnFocus}
+                            onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                            onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                          >
+                            Submit
+                          </button>
 
                           <button
                             type="button"
-                            disabled={!user}
-                            onMouseEnter={() => setHoverVoteId(s.id)}
-                            onMouseLeave={() => setHoverVoteId((cur) => (cur === s.id ? null : cur))}
-                            onClick={() => upvoteSuggestion(s.id)}
+                            onClick={() => {
+                              setOpenSuggestUid(null);
+                              setSuggestText("");
+                              setSuggestComment("");
+                            }}
+                            style={btnBase}
+                            onMouseDown={preventMouseDownFocus}
+                            onFocus={blurOnFocus}
+                            onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                            onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                          >
+                            Cancel
+                          </button>
+
+                          {!user ? <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>Sign in to submit.</div> : null}
+                        </div>
+
+                        <div style={{ height: 2, background: "rgba(0,0,0,0.18)", marginTop: 12 }} />
+                      </div>
+                    ) : null}
+
+                    {!collapseSuggestions && suggestionsByUid[p.pid]?.length ? (
+                      <div style={{ marginTop: 10, fontSize: 14 }} onClick={(e) => e.stopPropagation()}>
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 10,
+                            marginBottom: 6,
+                          }}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => setCollapsedUid((prev) => ({ ...prev, [p.pid]: !prev[p.pid] }))}
                             style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 8,
+                              fontWeight: 800,
                               padding: "6px 10px",
-                              fontSize: 12,
                               borderRadius: 10,
-                              border: "1px solid rgba(0,0,0,0.18)",
-                              background: !user ? "rgba(0,0,0,0.06)" : "white",
-                              cursor: !user ? "not-allowed" : "pointer",
-                              transition: "transform 120ms ease, box-shadow 120ms ease, background 120ms ease",
-                              transform: hoverVoteId === s.id && user ? "translateY(1px)" : "translateY(0px)",
-                              boxShadow:
-                                hoverVoteId === s.id && user
-                                  ? "inset 0 2px 4px rgba(0,0,0,0.18)"
-                                  : "0 1px 2px rgba(0,0,0,0.10)",
-                              opacity: !user ? 0.6 : 1,
-                              whiteSpace: "nowrap",
+                              border: "1px solid rgba(0,0,0,0.12)",
+                              background: "white",
+                              cursor: "pointer",
+                              boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
+                              outline: "none",
+                              appearance: "none",
+                            }}
+                            onMouseDown={preventMouseDownFocus}
+                            onFocus={blurOnFocus}
+                          >
+                            <span>Suggestions</span>
+                            <span style={{ fontSize: 12, opacity: 0.8 }}>{collapsedUid[p.pid] ? "▸" : "▾"}</span>
+                            <span style={{ fontSize: 12, opacity: 0.65 }}>({suggestionsByUid[p.pid].length})</span>
+                          </button>
+
+                          <div style={{ display: "flex", alignItems: "center" }}>
+                            <select
+                              aria-label="Sort suggestions"
+                              value={sortModeByUid[p.pid] ?? "top"}
+                              onChange={(e) =>
+                                setSortModeByUid((prev) => ({
+                                  ...prev,
+                                  [p.pid]: e.target.value as "top" | "newest",
+                                }))
+                              }
+                              style={{
+                                padding: "6px 10px",
+                                borderRadius: 10,
+                                border: "1px solid rgba(0,0,0,0.12)",
+                                background: "white",
+                                fontSize: 12,
+                                fontWeight: 800,
+                                outline: "none",
+                                cursor: "pointer",
+                              }}
+                            >
+                              <option value="top">Upvotes</option>
+                              <option value="newest">Newest</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        {!collapsedUid[p.pid] &&
+                          getSortedSuggestions(p.pid)
+                            .slice(0, 5)
+                            .map((s) => (
+                              <div
+                                key={s.id}
+                                style={{
+                                  padding: "6px 8px",
+                                  border: "1px solid rgba(0,0,0,0.10)",
+                                  borderRadius: 10,
+                                  marginBottom: 6,
+                                  fontSize: 14,
+                                  background: "rgba(255,255,255,0.75)",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    alignItems: "flex-start",
+                                    gap: 10,
+                                  }}
+                                >
+                                  <div style={{ whiteSpace: "pre-wrap", flex: 1 }}>{s.suggested_text}</div>
+                                  <div style={{ fontSize: 13, opacity: 0.85, whiteSpace: "nowrap" }}>▲ {s.vote_count ?? 0}</div>
+                                </div>
+
+                                {s.comment ? (
+                                  <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
+                                    <span style={{ fontWeight: 700 }}>Note:</span> {s.comment}
+                                  </div>
+                                ) : null}
+
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    alignItems: "center",
+                                    gap: 10,
+                                    marginTop: 8,
+                                  }}
+                                >
+                                  <div style={{ minWidth: 0 }}>
+                                    <div
+                                      style={{
+                                        fontSize: 13,
+                                        opacity: 0.75,
+                                        overflow: "hidden",
+                                        textOverflow: "ellipsis",
+                                        whiteSpace: "nowrap",
+                                      }}
+                                    >
+                                      by {s.author_username || usernameByUserId[s.user_id] || `user:${s.user_id.slice(0, 8)}`} •{" "}
+                                      {new Date(s.created_at).toLocaleString()}
+                                    </div>
+                                    {!user ? <div style={{ marginTop: 4, fontSize: 12, opacity: 0.8 }}>Sign in to vote.</div> : null}
+                                  </div>
+
+                                  <button
+                                    type="button"
+                                    disabled={!user}
+                                    onMouseEnter={() => setHoverVoteId(s.id)}
+                                    onMouseLeave={() => setHoverVoteId((cur) => (cur === s.id ? null : cur))}
+                                    onClick={() => upvoteSuggestion(s.id)}
+                                    style={{
+                                      padding: "6px 10px",
+                                      fontSize: 12,
+                                      borderRadius: 10,
+                                      border: "1px solid rgba(0,0,0,0.18)",
+                                      background: !user ? "rgba(0,0,0,0.06)" : "white",
+                                      cursor: !user ? "not-allowed" : "pointer",
+                                      transition: "transform 120ms ease, box-shadow 120ms ease, background 120ms ease",
+                                      transform: hoverVoteId === s.id && user ? "translateY(1px)" : "translateY(0px)",
+                                      boxShadow:
+                                        hoverVoteId === s.id && user
+                                          ? "inset 0 2px 4px rgba(0,0,0,0.18)"
+                                          : "0 1px 2px rgba(0,0,0,0.10)",
+                                      opacity: !user ? 0.6 : 1,
+                                      whiteSpace: "nowrap",
+                                    }}
+                                  >
+                                    Upvote
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+
+                        {collapsedUid[p.pid] ? (
+                          <div style={{ marginTop: 4, opacity: 0.7, paddingLeft: 2 }}>Click “Suggestions” to expand.</div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div style={{ opacity: 0.75, fontSize: 15 }}>No paragraph transcription available for this page.</div>
+          )
+        ) : (
+          <div style={{ fontSize: 16 }}>
+            {lines.map((l) => (
+              <div
+                key={l.uid}
+                ref={(el) => {
+                  lineElByIdRef.current[String(l.uid)] = el;
+                }}
+                onMouseEnter={() => {
+                  setActiveSource("right");
+                  setActiveId(l.uid);
+                  setActiveParagraphId(null);
+                  setActiveBox(boxByUidRef.current[l.uid] ?? null);
+                }}
+                onMouseLeave={() => {
+                  setActiveSource(null);
+                  setActiveId(null);
+                  setActiveBox(null);
+                }}
+                onClick={() => {
+                  setActiveSource("right");
+                  setActiveId(l.uid);
+                  setActiveParagraphId(null);
+                  setActiveBox(boxByUidRef.current[l.uid] ?? null);
+                }}
+                style={{
+                  padding: "10px 6px",
+                  borderRadius: 10,
+                  lineHeight: 1.3,
+                  fontSize: 15,
+                  cursor: "pointer",
+                  border: "1px solid rgba(0,0,0,0.06)",
+                  background: activeId === l.uid ? "rgba(255,242,168,0.75)" : "transparent",
+                  boxShadow: "none",
+                  fontFamily: "Georgia, 'Times New Roman', serif",
+                }}
+              >
+                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>{l.transcription}</div>
+                  <button
+                    type="button"
+                    aria-label="Suggest edit"
+                    title="Suggest edit"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (openSuggestUid === l.uid) {
+                        setOpenSuggestUid(null);
+                        setSuggestText("");
+                        setSuggestComment("");
+                      } else {
+                        setOpenSuggestUid(l.uid);
+                        setSuggestText(l.transcription);
+                        setSuggestComment("");
+                      }
+                    }}
+                    style={iconBtn}
+                    onMouseDown={preventMouseDownFocus}
+                    onFocus={blurOnFocus}
+                    onMouseEnter={(e) => {
+                      (e.currentTarget as HTMLButtonElement).style.background = "rgba(0,0,0,0.06)";
+                      (e.currentTarget as HTMLButtonElement).style.transform = "translateY(1px)";
+                    }}
+                    onMouseLeave={(e) => {
+                      (e.currentTarget as HTMLButtonElement).style.background = "transparent";
+                      (e.currentTarget as HTMLButtonElement).style.transform = "translateY(0px)";
+                    }}
+                  >
+                    <PencilGlyph size={16} />
+                  </button>
+                </div>
+
+                {openSuggestUid === l.uid ? (
+                  <div style={{ marginTop: 8 }} onClick={(e) => e.stopPropagation()}>
+                    <textarea
+                      value={suggestText}
+                      onChange={(e) => setSuggestText(e.target.value)}
+                      rows={3}
+                      style={{ width: "100%", padding: 8, borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)" }}
+                    />
+                    <textarea
+                      value={suggestComment}
+                      onChange={(e) => setSuggestComment(e.target.value)}
+                      rows={2}
+                      placeholder="Optional note (why this edit?)"
+                      style={{
+                        width: "100%",
+                        padding: 8,
+                        borderRadius: 10,
+                        border: "1px solid rgba(0,0,0,0.15)",
+                        marginTop: 8,
+                      }}
+                    />
+                    <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
+                      <button
+                        type="button"
+                        onClick={() => submitSuggestion(l.uid, l.transcription)}
+                        style={btnBase}
+                        onMouseDown={preventMouseDownFocus}
+                        onFocus={blurOnFocus}
+                        onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                        onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                      >
+                        Submit
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOpenSuggestUid(null);
+                          setSuggestText("");
+                          setSuggestComment("");
+                        }}
+                        style={btnBase}
+                        onMouseDown={preventMouseDownFocus}
+                        onFocus={blurOnFocus}
+                        onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                        onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                      >
+                        Cancel
+                      </button>
+
+                      {!user ? <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>Sign in to submit.</div> : null}
+                    </div>
+
+                    <div style={{ height: 2, background: "rgba(0,0,0,0.18)", marginTop: 12 }} />
+                  </div>
+                ) : null}
+
+                {!collapseSuggestions && suggestionsByUid[l.uid]?.length ? (
+                  <div style={{ marginTop: 10, fontSize: 14 }} onClick={(e) => e.stopPropagation()}>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 10,
+                        marginBottom: 6,
+                      }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setCollapsedUid((prev) => ({ ...prev, [l.uid]: !prev[l.uid] }))}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 8,
+                          fontWeight: 800,
+                          padding: "6px 10px",
+                          borderRadius: 10,
+                          border: "1px solid rgba(0,0,0,0.12)",
+                          background: "white",
+                          cursor: "pointer",
+                          boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
+                          outline: "none",
+                          appearance: "none",
+                        }}
+                        onMouseDown={preventMouseDownFocus}
+                        onFocus={blurOnFocus}
+                      >
+                        <span>Suggestions</span>
+                        <span style={{ fontSize: 12, opacity: 0.8 }}>{collapsedUid[l.uid] ? "▸" : "▾"}</span>
+                        <span style={{ fontSize: 12, opacity: 0.65 }}>({suggestionsByUid[l.uid].length})</span>
+                      </button>
+
+                      <div style={{ display: "flex", alignItems: "center" }}>
+                        <select
+                          aria-label="Sort suggestions"
+                          value={sortModeByUid[l.uid] ?? "top"}
+                          onChange={(e) =>
+                            setSortModeByUid((prev) => ({
+                              ...prev,
+                              [l.uid]: e.target.value as "top" | "newest",
+                            }))
+                          }
+                          style={{
+                            padding: "6px 10px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(0,0,0,0.12)",
+                            background: "white",
+                            fontSize: 12,
+                            fontWeight: 800,
+                            outline: "none",
+                            cursor: "pointer",
+                          }}
+                        >
+                          <option value="top">Upvotes</option>
+                          <option value="newest">Newest</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {!collapsedUid[l.uid] &&
+                      getSortedSuggestions(l.uid)
+                        .slice(0, 5)
+                        .map((s) => (
+                          <div
+                            key={s.id}
+                            style={{
+                              padding: "6px 8px",
+                              border: "1px solid rgba(0,0,0,0.10)",
+                              borderRadius: 10,
+                              marginBottom: 6,
+                              fontSize: 14,
+                              background: "rgba(255,255,255,0.75)",
                             }}
                           >
-                            Upvote
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                            <div
+                              style={{
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "flex-start",
+                                gap: 10,
+                              }}
+                            >
+                              <div style={{ whiteSpace: "pre-wrap", flex: 1 }}>{s.suggested_text}</div>
+                              <div style={{ fontSize: 13, opacity: 0.85, whiteSpace: "nowrap" }}>▲ {s.vote_count ?? 0}</div>
+                            </div>
 
-                {collapsedUid[l.uid] ? (
-                  <div style={{ marginTop: 4, opacity: 0.7, paddingLeft: 2 }}>
-                    Click “Suggestions” to expand.
+                            {s.comment ? (
+                              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
+                                <span style={{ fontWeight: 700 }}>Note:</span> {s.comment}
+                              </div>
+                            ) : null}
+
+                            <div
+                              style={{
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "center",
+                                gap: 10,
+                                marginTop: 8,
+                              }}
+                            >
+                              <div style={{ minWidth: 0 }}>
+                                <div
+                                  style={{
+                                    fontSize: 13,
+                                    opacity: 0.75,
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  by {s.author_username || usernameByUserId[s.user_id] || `user:${s.user_id.slice(0, 8)}`} •{" "}
+                                  {new Date(s.created_at).toLocaleString()}
+                                </div>
+                                {!user ? <div style={{ marginTop: 4, fontSize: 12, opacity: 0.8 }}>Sign in to vote.</div> : null}
+                              </div>
+
+                              <button
+                                type="button"
+                                disabled={!user}
+                                onMouseEnter={() => setHoverVoteId(s.id)}
+                                onMouseLeave={() => setHoverVoteId((cur) => (cur === s.id ? null : cur))}
+                                onClick={() => upvoteSuggestion(s.id)}
+                                style={{
+                                  padding: "6px 10px",
+                                  fontSize: 12,
+                                  borderRadius: 10,
+                                  border: "1px solid rgba(0,0,0,0.18)",
+                                  background: !user ? "rgba(0,0,0,0.06)" : "white",
+                                  cursor: !user ? "not-allowed" : "pointer",
+                                  transition: "transform 120ms ease, box-shadow 120ms ease, background 120ms ease",
+                                  transform: hoverVoteId === s.id && user ? "translateY(1px)" : "translateY(0px)",
+                                  boxShadow:
+                                    hoverVoteId === s.id && user
+                                      ? "inset 0 2px 4px rgba(0,0,0,0.18)"
+                                      : "0 1px 2px rgba(0,0,0,0.10)",
+                                  opacity: !user ? 0.6 : 1,
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                Upvote
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+
+                    {collapsedUid[l.uid] ? (
+                      <div style={{ marginTop: 4, opacity: 0.7, paddingLeft: 2 }}>Click “Suggestions” to expand.</div>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
-            ) : null}
+            ))}
           </div>
-        ))}
+        )}
       </div>
 
            {/* Close the 2-panel grid before rendering overlays */}
       </div>
+      )}
 
       {/* LEADERBOARD MODAL OVERLAY (does not affect layout) */}
       {showLeaderboard ? (
