@@ -623,42 +623,63 @@ export default function Home() {
   };
 
   useEffect(() => {
-    // Allow deep-linking directly into the viewer
+    // Allow deep-linking directly into the viewer and support Back/Forward.
     if (typeof window === "undefined") return;
-    const sp = new URLSearchParams(window.location.search);
-    if (sp.get("start") === "1") setStarted(true);
+
+    const syncFromUrl = () => {
+      const sp = new URLSearchParams(window.location.search);
+      setStarted(sp.get("start") === "1");
+    };
+
+    syncFromUrl();
+    window.addEventListener("popstate", syncFromUrl);
+    return () => window.removeEventListener("popstate", syncFromUrl);
   }, []);
 
+  async function loadDocAndPdf() {
+    if (!PDF_URL || !JSON_URL) {
+      setFatalError(
+        "Missing NEXT_PUBLIC_PDF_URL or NEXT_PUBLIC_JSON_URL. Set these in Vercel → Project → Settings → Environment Variables."
+      );
+      return;
+    }
+
+    // Reset viewer state so entering the viewer always triggers a clean render
+    setFatalError(null);
+    setDoc(null);
+    setPdf(null);
+
+    const r = await fetch(JSON_URL);
+    if (!r.ok) throw new Error(`JSON fetch failed: ${r.status}`);
+    const j = (await r.json()) as DocJson;
+    setDoc(j);
+
+    const firstValid =
+      Object.keys(j).find((k) => pageKeyToNumber(k) != null) ?? Object.keys(j)[0];
+    setPageKey(firstValid);
+
+    // Dynamically import pdf.js on the client only.
+    // NOTE: importing the package root keeps TypeScript happy (the legacy subpath often has no .d.ts).
+    const pdfjsLib: any = await import("pdfjs-dist");
+    pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+      "pdfjs-dist/build/pdf.worker.min.mjs",
+      import.meta.url
+    ).toString();
+
+    const loaded = await pdfjsLib.getDocument(PDF_URL).promise;
+    setPdf(loaded);
+  }
+
   useEffect(() => {
-    (async () => {
-      if (!PDF_URL || !JSON_URL) {
-        setFatalError("Missing NEXT_PUBLIC_PDF_URL or NEXT_PUBLIC_JSON_URL. Set these in Vercel → Project → Settings → Environment Variables.");
-        return;
-      }
+    // Only load heavy viewer assets once the user enters the viewer.
+    if (!started) return;
 
-      const r = await fetch(JSON_URL);
-      if (!r.ok) throw new Error(`JSON fetch failed: ${r.status}`);
-      const j = (await r.json()) as DocJson;
-      setDoc(j);
-
-      const firstValid = Object.keys(j).find(k => pageKeyToNumber(k) != null) ?? Object.keys(j)[0];
-      setPageKey(firstValid);
-
-      // Dynamically import pdf.js on the client only.
-      // NOTE: importing the package root keeps TypeScript happy (the legacy subpath often has no .d.ts).
-      const pdfjsLib: any = await import("pdfjs-dist");
-      pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-        "pdfjs-dist/build/pdf.worker.min.mjs",
-        import.meta.url
-      ).toString();
-
-      const loaded = await pdfjsLib.getDocument(PDF_URL).promise;
-      setPdf(loaded);
-    })().catch(e => {
+    loadDocAndPdf().catch((e) => {
       console.error(e);
       setFatalError(e?.message || String(e));
     });
-  }, [PDF_URL, JSON_URL]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [started, PDF_URL, JSON_URL]);
 
   useEffect(() => {
     if (!supabase) return;
@@ -871,6 +892,16 @@ export default function Home() {
         const el = mapDivRef.current;
         if (!L || !el) return;
 
+        // Wait until the container has a real size (prevents blank map until refresh)
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 10 || rect.height < 10) {
+          requestAnimationFrame(() => {
+            try {
+              leafletMapRef.current?.invalidateSize?.();
+            } catch {}
+          });
+        }
+
         // Init map once
         if (!leafletMapRef.current) {
           leafletMapRef.current = L.map(el, {
@@ -894,7 +925,7 @@ export default function Home() {
         }
 
         // Add markers
-        for (const d of mapDocs) {
+        for (const d of docs) {
           const m = L.marker([d.lat, d.lng]);
           m.bindPopup(`<b>${String(d.title).replace(/</g, "&lt;")}</b>`);
           m.addTo(leafletLayerRef.current);
@@ -907,12 +938,23 @@ export default function Home() {
           leafletMapRef.current.setView([20, 0], 2);
         }
 
-        // Fix sizing when switching views
-        setTimeout(() => {
+        // Fix sizing when switching views (Leaflet needs a real-sized container)
+        const invalidate = () => {
           try {
             leafletMapRef.current?.invalidateSize?.();
           } catch {}
-        }, 50);
+        };
+
+        // next paint
+        requestAnimationFrame(() => {
+          invalidate();
+          // one more paint later
+          requestAnimationFrame(() => invalidate());
+        });
+
+        // and a couple timed retries for slower layouts
+        setTimeout(invalidate, 150);
+        setTimeout(invalidate, 400);
       } catch (e: any) {
         console.warn("map init failed", e);
         setMapError(e?.message || String(e));
@@ -921,9 +963,47 @@ export default function Home() {
 
     return () => {
       cancelled = true;
+
+      // IMPORTANT: when navigating away from the Map view, Leaflet keeps a reference
+      // to the old DOM element. If we re-enter Map, the div is a new element and
+      // Leaflet won't re-render correctly unless we tear down the old map instance.
+      try {
+        if (leafletMapRef.current) {
+          leafletMapRef.current.remove();
+        }
+      } catch {}
+
+      leafletMapRef.current = null;
+      leafletLayerRef.current = null;
+
+      // Clear any leftover DOM from Leaflet just in case
+      try {
+        if (mapDivRef.current) mapDivRef.current.innerHTML = "";
+      } catch {}
+
+      // Clear errors/loading when leaving map
+      setIsLoadingMap(false);
+      setMapError(null);
     };
     // We intentionally exclude mapDocs from deps to avoid re-initting; marker refresh is handled by the button below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode]);
+
+  useEffect(() => {
+    if (viewMode === "map") return;
+
+    // If the map exists but the user left the map view, tear it down so
+    // returning to Map always initializes cleanly.
+    try {
+      if (leafletMapRef.current) leafletMapRef.current.remove();
+    } catch {}
+
+    leafletMapRef.current = null;
+    leafletLayerRef.current = null;
+
+    try {
+      if (mapDivRef.current) mapDivRef.current.innerHTML = "";
+    } catch {}
   }, [viewMode]);
 
   useEffect(() => {
@@ -1435,7 +1515,22 @@ export default function Home() {
             <div style={{ marginTop: 22, display: "flex", justifyContent: "center" }}>
               <button
                 type="button"
-                onClick={() => setStarted(true)}
+                onClick={() => {
+                  // Ensure we enter the viewer in a clean state
+                  setViewMode("viewer");
+                  setShowLeaderboard(false);
+                  setShowSignin(false);
+                  setShowSignup(false);
+
+                  setStarted(true);
+
+                  // Make the viewer a distinct URL state so users can go back to the welcome page.
+                  try {
+                    const url = new URL(window.location.href);
+                    url.searchParams.set("start", "1");
+                    window.history.pushState({}, "", url.toString());
+                  } catch {}
+                }}
                 disabled={missingEnv.length > 0}
                 title={
                   missingEnv.length
@@ -1658,12 +1753,24 @@ export default function Home() {
     setMapError(null);
 
     try {
+      // Preferred: fetch documents with coordinates
       const { data, error } = await supabase
         .from("documents")
         .select("id,title,lat,lng")
         .limit(5000);
 
-      if (error) throw error;
+      if (error) {
+        const msg = error.message || String(error);
+
+        // If the project hasn't added lat/lng yet, don't show an error.
+        // Just treat it as: "no locations configured".
+        if (/column\s+documents\.(lat|lng)\s+does\s+not\s+exist/i.test(msg)) {
+          setMapDocs([]);
+          return [];
+        }
+
+        throw error;
+      }
 
       const rows = (data ?? []) as any[];
       const docs: MapDoc[] = rows
@@ -1679,16 +1786,8 @@ export default function Home() {
       return docs;
     } catch (e: any) {
       console.warn("map docs load failed", e);
-      const msg = e?.message || String(e);
-
-      if (/column\s+documents\.(lat|lng)\s+does\s+not\s+exist/i.test(msg)) {
-        setMapError(
-          "Map locations aren’t configured yet. Add nullable `lat` and `lng` columns to the `documents` table, then reload."
-        );
-      } else {
-        setMapError(msg);
-      }
-
+      // For any other error, show it.
+      setMapError(e?.message || String(e));
       setMapDocs([]);
       return [];
     } finally {
@@ -1744,6 +1843,44 @@ export default function Home() {
       >
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ fontWeight: 900, fontSize: 18 }}>Hudson&apos;s Bay Company Records</div>
+
+          <button
+            type="button"
+            onClick={() => {
+              setStarted(false);
+              setFatalError(null);
+              setActiveId(null);
+              setActiveParagraphId(null);
+              setActiveBox(null);
+              setOpenSuggestUid(null);
+              setViewMode("viewer");
+              setShowLeaderboard(false);
+              setShowSignin(false);
+              setShowSignup(false);
+              try {
+                const url = new URL(window.location.href);
+                url.searchParams.delete("start");
+                window.history.pushState(
+                  {},
+                  "",
+                  url.pathname +
+                    (url.searchParams.toString() ? `?${url.searchParams.toString()}` : "")
+                );
+              } catch {}
+            }}
+            style={btnSecondary}
+            onMouseDown={preventMouseDownFocus}
+            onFocus={blurOnFocus}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "rgba(0,0,0,0.06)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "transparent";
+            }}
+          >
+            Home
+          </button>
+
           {isLoadingSuggestions ? (
             <div style={{ fontSize: 12, opacity: 0.75, whiteSpace: "nowrap" }}>Loading…</div>
           ) : null}
@@ -1896,7 +2033,9 @@ export default function Home() {
           />
 
           <div style={{ padding: 10, borderTop: "1px solid #e6e6e6", fontSize: 12, opacity: 0.8 }}>
-            Showing {mapDocs.length.toLocaleString()} documents with locations.
+            {mapDocs.length
+              ? `Showing ${mapDocs.length.toLocaleString()} documents with locations.`
+              : "No document locations yet."}
           </div>
         </div>
       ) : (
@@ -2037,35 +2176,40 @@ export default function Home() {
                 onClick={() => setTranscriptionMode("lines")}
                 aria-pressed={transcriptionMode === "lines"}
                 style={{
-                  padding: "6px 10px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: transcriptionMode === "lines" ? "rgba(0,0,0,0.08)" : "transparent",
-                  fontWeight: 800,
-                  cursor: "pointer",
-                  outline: "none",
+                  ...btnBase,
+                  ...(transcriptionMode === "lines"
+                    ? { border: "1px solid rgba(0,0,0,0.22)", background: "white", fontWeight: 900 }
+                    : { border: "1px solid rgba(0,0,0,0.14)", background: "white", fontWeight: 800, opacity: 0.85 }),
                 }}
-                onMouseDown={preventMouseDownFocus}
+                onMouseDown={(e) => {
+                  // prevent the "stuck selected" look from focus rings
+                  e.preventDefault();
+                  (e.currentTarget as HTMLButtonElement).blur();
+                }}
                 onFocus={blurOnFocus}
+                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
               >
                 By Line
               </button>
-
               <button
                 type="button"
                 onClick={() => setTranscriptionMode("paragraph")}
                 aria-pressed={transcriptionMode === "paragraph"}
                 style={{
-                  padding: "6px 10px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(0,0,0,0.2)",
-                  background: transcriptionMode === "paragraph" ? "rgba(0,0,0,0.08)" : "transparent",
-                  fontWeight: 800,
-                  cursor: "pointer",
-                  outline: "none",
+                  ...btnBase,
+                  ...(transcriptionMode === "paragraph"
+                    ? { border: "1px solid rgba(0,0,0,0.22)", background: "white", fontWeight: 900 }
+                    : { border: "1px solid rgba(0,0,0,0.14)", background: "white", fontWeight: 800, opacity: 0.85 }),
                 }}
-                onMouseDown={preventMouseDownFocus}
+                onMouseDown={(e) => {
+                  // prevent the "stuck selected" look from focus rings
+                  e.preventDefault();
+                  (e.currentTarget as HTMLButtonElement).blur();
+                }}
                 onFocus={blurOnFocus}
+                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
               >
                 By Paragraph
               </button>
