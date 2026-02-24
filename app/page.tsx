@@ -11,6 +11,9 @@ type Line = {
   bbox: [number, number, number, number];
   // Normalized box may exist but we won't rely on it
   bboxn?: [number, number, number, number];
+  // Some JSONs include per-line confidence/class
+  confidence?: number;
+  class?: string;
 };
 
 type LineWithUid = Line & {
@@ -19,7 +22,25 @@ type LineWithUid = Line & {
 type PageObj = {
   width: number;
   height: number;
-  paragraphs: { lines: Line[]; llm_text?: string | null }[];
+  paragraphs: Array<{
+    class?: string;
+    confidence?: number;
+    // Some JSONs include a bbox for paragraph blocks; optional.
+    bbox?: [number, number, number, number];
+    bboxn?: [number, number, number, number];
+    lines: Line[];
+    llm_text?: string | null;
+  }>;
+  // Some JSONs also include extracted lists/tables. Make them optional so old JSONs still work.
+  lists?: Array<{
+    class?: string;
+    confidence?: number;
+    bbox: [number, number, number, number];
+    bboxn?: [number, number, number, number];
+    list_id?: string;
+    lines: Line[];
+  }>;
+  tables?: Array<any>;
 };
 type DocJson = Record<string, PageObj>;
 
@@ -36,6 +57,20 @@ type SuggestionRow = {
   author_username?: string | null; // snapshot stored on suggestion
 };
 
+type LowConfLabelRow = {
+  id: string;
+  document_id: string;
+  page_key: string;
+  target_pid: string;
+  predicted_class?: string | null;
+  predicted_confidence?: number | null;
+  corrected_class: "Paragraph" | "List" | "Table" | "Other";
+  other_text?: string | null;
+  user_id?: string | null;
+  author_username?: string | null;
+  updated_at?: string | null;
+};
+
 type MapDoc = {
   id: string;
   title: string;
@@ -49,14 +84,98 @@ function pageKeyToNumber(pageKey: string) {
 }
 function getAllLinesForPage(p: PageObj): LineWithUid[] {
   const out: LineWithUid[] = [];
+
+  // Paragraph lines (KEEP existing uid scheme so old suggestions continue to match)
   (p.paragraphs || []).forEach((par, pIdx) => {
     (par.lines || []).forEach((l, lIdx) => {
       out.push({ ...l, uid: `${pIdx}-${lIdx}` });
     });
   });
+
+  // List lines (new uid namespace)
+  (p.lists || []).forEach((lst: any, listIdx: number) => {
+    (lst?.lines || []).forEach((l: any, lIdx: number) => {
+      out.push({ ...l, uid: `list-${listIdx}-${lIdx}` });
+    });
+  });
+
+  // Table lines (best-effort: only if table has `lines` shaped like Line[])
+  (p.tables || []).forEach((tbl: any, tIdx: number) => {
+    const tLines = Array.isArray(tbl?.lines) ? tbl.lines : [];
+    tLines.forEach((l: any, lIdx: number) => {
+      out.push({ ...l, uid: `table-${tIdx}-${lIdx}` });
+    });
+  });
+
+  // ---- ORDER FIX ----
+  // The JSON often stores lists/tables separately, but visually they belong mid-page.
+  // If the scan is a 2-page spread (left page + right page on the same PDF page),
+  // order by page-half first (left half, then right half), and within each half by y then x.
+  // Otherwise, just sort by y then x.
+
+  const pageW = Number((p as any).width);
+  const pageH = Number((p as any).height);
+
+  const safeKey = (l: any) => {
+    const bb = l?.bbox;
+    if (!Array.isArray(bb) || bb.length !== 4) return null;
+    const x1 = Number(bb[0]);
+    const y1 = Number(bb[1]);
+    const x2 = Number(bb[2]);
+    const y2 = Number(bb[3]);
+    if (![x1, y1, x2, y2, pageW, pageH].every((v) => Number.isFinite(v))) return null;
+    if (pageW <= 0 || pageH <= 0) return null;
+
+    // normalize
+    const y = y1 / pageH;
+    const x = x1 / pageW;
+    const xCenter = ((x1 + x2) * 0.5) / pageW;
+
+    return { y, x, xCenter };
+  };
+
+  // Detect a 2-page spread: meaningful content on both far-left and far-right.
+  // (Heuristic avoids forcing a split on single-page scans.)
+  const centers: number[] = [];
+  for (const l of out) {
+    const k = safeKey(l);
+    if (k) centers.push(k.xCenter);
+  }
+
+  let isTwoPageSpread = false;
+  if (centers.length >= 10) {
+    const leftCount = centers.filter((c) => c < 0.45).length;
+    const rightCount = centers.filter((c) => c > 0.55).length;
+    const fracLeft = leftCount / centers.length;
+    const fracRight = rightCount / centers.length;
+    // require both sides to have substantial content
+    if (fracLeft > 0.20 && fracRight > 0.20) isTwoPageSpread = true;
+  }
+
+  out.sort((a, b) => {
+    const ka = safeKey(a);
+    const kb = safeKey(b);
+
+    // If either key missing, push it to the end deterministically.
+    if (!ka && !kb) return String(a.uid).localeCompare(String(b.uid));
+    if (!ka) return 1;
+    if (!kb) return -1;
+
+    if (isTwoPageSpread) {
+      const halfA = ka.xCenter < 0.5 ? 0 : 1;
+      const halfB = kb.xCenter < 0.5 ? 0 : 1;
+      if (halfA !== halfB) return halfA - halfB; // left half first
+    }
+
+    if (ka.y !== kb.y) return ka.y - kb.y;
+    if (ka.x !== kb.x) return ka.x - kb.x;
+
+    // stable tie-breaker to avoid jitter across renders
+    return String(a.uid).localeCompare(String(b.uid));
+  });
+
   return out;
 }
-
 
 export default function Home() {
   const PDF_URL = process.env.NEXT_PUBLIC_PDF_URL ?? "";
@@ -173,7 +292,51 @@ export default function Home() {
 
   const lineElByIdRef = useRef<Record<string, HTMLDivElement | null>>({});
   const paragraphElByIdRef = useRef<Record<string, HTMLDivElement | null>>({});
-  const [activeSource, setActiveSource] = useState<"left" | "right" | null>(null);  
+  const [activeSource, setActiveSource] = useState<"left" | "right" | "menu" | null>(null);
+  const [autoScrollEnabled, setAutoScrollEnabled] = useState(true);
+  const [showLowConfidenceMenu, setShowLowConfidenceMenu] = useState(false);
+  const [lowConfLabelsByKey, setLowConfLabelsByKey] = useState<
+  Record<
+    string,
+    {
+      corrected_class: "Paragraph" | "List" | "Table" | "Other";
+      other_text: string;
+      author_username?: string;
+      user_id?: string;
+      updated_at?: string;
+    }
+  >
+>({});
+
+const [lowConfDraftByKey, setLowConfDraftByKey] = useState<
+  Record<string, { corrected_class: "Paragraph" | "List" | "Table" | "Other"; other_text: string }>
+>({});
+
+const [isSavingLowConf, setIsSavingLowConf] = useState<Record<string, boolean>>({});
+
+const lowConfMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!showLowConfidenceMenu) return;
+
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      const menuEl = lowConfMenuRef.current;
+      if (menuEl && target && menuEl.contains(target)) return; // click inside menu -> don't close
+      setShowLowConfidenceMenu(false);
+    };
+
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [showLowConfidenceMenu]);
+  const [pendingLowConfJump, setPendingLowConfJump] = useState<
+    | null
+    | {
+        pageKey: string;
+        targetPid: string; // paragraph-mode pid: p-#, list-#, table-#
+        box: { x: number; y: number; w: number; h: number };
+      }
+  >(null);
 
   const [doc, setDoc] = useState<DocJson | null>(null);
   const [pdf, setPdf] = useState<any>(null);
@@ -280,6 +443,284 @@ export default function Home() {
     // Otherwise, only show pages that exist in the JSON
     return Object.keys(doc).sort((a, b) => (pageKeyToNumber(a) ?? 0) - (pageKeyToNumber(b) ?? 0));
   }, [doc, pdf]);
+
+  function confToPct(c: any): number | null {
+    if (!Number.isFinite(Number(c))) return null;
+    const n = Number(c);
+    // Support both 0..1 and 0..100 style confidences
+    return n <= 1 ? n * 100 : n;
+  }
+
+  function blockBoxFromLines(lines: any[], pageW: number, pageH: number) {
+    let minX = 1,
+      minY = 1,
+      maxX = 0,
+      maxY = 0;
+    let found = false;
+
+    for (const ln of lines || []) {
+      const bb = ln?.bbox;
+      if (!Array.isArray(bb) || bb.length !== 4) continue;
+      const nb = normBoxFromPixels(bb as [number, number, number, number], pageW, pageH);
+      if (!nb) continue;
+      found = true;
+      minX = Math.min(minX, nb.x);
+      minY = Math.min(minY, nb.y);
+      maxX = Math.max(maxX, nb.x + nb.w);
+      maxY = Math.max(maxY, nb.y + nb.h);
+    }
+
+    if (!found) return null;
+
+    minX = Math.min(1, Math.max(0, minX));
+    minY = Math.min(1, Math.max(0, minY));
+    maxX = Math.min(1, Math.max(0, maxX));
+    maxY = Math.min(1, Math.max(0, maxY));
+
+    const box = { x: minX, y: minY, w: Math.max(0, maxX - minX), h: Math.max(0, maxY - minY) };
+    if (box.w <= 0 || box.h <= 0) return null;
+    return box;
+  }
+
+const lowConfItems = useMemo(() => {
+  if (!doc)
+    return [] as Array<{
+      pageKey: string;
+      pageNum: number | null;
+      label: string;
+      confPct: number;
+      targetPid: string;
+      box: { x: number; y: number; w: number; h: number } | null;
+    }>;
+
+  const TH = 0.5; // 50%
+
+  const out: Array<{
+    pageKey: string;
+    pageNum: number | null;
+    label: string;
+    confPct: number;
+    targetPid: string;
+    box: { x: number; y: number; w: number; h: number } | null;
+  }> = [];
+
+  for (const pk of Object.keys(doc)) {
+    const pageObj: any = (doc as any)[pk];
+    if (!pageObj) continue;
+
+    const pageNum = pageKeyToNumber(pk);
+    const pageW = Number(pageObj.width);
+    const pageH = Number(pageObj.height);
+
+    // -----------------
+    // PARAGRAPH blocks (class === "prgph")
+    // NOTE: we IGNORE line-level classes entirely.
+    // -----------------
+    const pars: any[] = Array.isArray(pageObj.paragraphs) ? pageObj.paragraphs : [];
+    for (let pIdx = 0; pIdx < pars.length; pIdx++) {
+      const par: any = pars[pIdx];
+      const cls = String(par?.class ?? "");
+      if (cls !== "prgph") continue;
+
+      const c = Number(par?.confidence);
+      if (!Number.isFinite(c) || c >= TH) continue;
+
+      const pid = `p-${pIdx}`;
+
+      // Prefer paragraph bbox if present; otherwise derive from lines (bbox union)
+      let nb:
+        | { x: number; y: number; w: number; h: number; area: number }
+        | null = null;
+
+      if (Array.isArray(par?.bbox) && par.bbox.length === 4) {
+        nb = normBoxFromPixels(par.bbox as [number, number, number, number], pageW, pageH);
+      } else {
+        const linesInPar: any[] = Array.isArray(par?.lines) ? par.lines : [];
+        let minX = 1,
+          minY = 1,
+          maxX = 0,
+          maxY = 0;
+        let found = false;
+
+        for (const ln of linesInPar) {
+          const bb = Array.isArray(ln?.bbox) ? (ln.bbox as [number, number, number, number]) : null;
+          if (!bb) continue;
+          const t = normBoxFromPixels(bb, pageW, pageH);
+          if (!t) continue;
+          found = true;
+          minX = Math.min(minX, t.x);
+          minY = Math.min(minY, t.y);
+          maxX = Math.max(maxX, t.x + t.w);
+          maxY = Math.max(maxY, t.y + t.h);
+        }
+
+        if (found) {
+          const w = Math.max(0, maxX - minX);
+          const h = Math.max(0, maxY - minY);
+          if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
+        }
+      }
+
+      out.push({
+        pageKey: pk,
+        pageNum,
+        label: "Paragraph",
+        confPct: c * 100,
+        targetPid: pid,
+        box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+      });
+    }
+
+    // -----------------
+    // LIST blocks (class === "list")
+    // -----------------
+    const lists: any[] = Array.isArray(pageObj.lists) ? pageObj.lists : [];
+    for (let listIdx = 0; listIdx < lists.length; listIdx++) {
+      const lst: any = lists[listIdx];
+      const cls = String(lst?.class ?? "");
+      if (cls !== "list") continue;
+
+      const c = Number(lst?.confidence);
+      if (!Number.isFinite(c) || c >= TH) continue;
+
+      const pid = `list-${listIdx}`;
+
+      let nb:
+        | { x: number; y: number; w: number; h: number; area: number }
+        | null = null;
+
+      if (Array.isArray(lst?.bbox) && lst.bbox.length === 4) {
+        nb = normBoxFromPixels(lst.bbox as [number, number, number, number], pageW, pageH);
+      } else {
+        const linesInList: any[] = Array.isArray(lst?.lines) ? lst.lines : [];
+        let minX = 1,
+          minY = 1,
+          maxX = 0,
+          maxY = 0;
+        let found = false;
+
+        for (const ln of linesInList) {
+          const bb = Array.isArray(ln?.bbox) ? (ln.bbox as [number, number, number, number]) : null;
+          if (!bb) continue;
+          const t = normBoxFromPixels(bb, pageW, pageH);
+          if (!t) continue;
+          found = true;
+          minX = Math.min(minX, t.x);
+          minY = Math.min(minY, t.y);
+          maxX = Math.max(maxX, t.x + t.w);
+          maxY = Math.max(maxY, t.y + t.h);
+        }
+
+        if (found) {
+          const w = Math.max(0, maxX - minX);
+          const h = Math.max(0, maxY - minY);
+          if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
+        }
+      }
+
+      out.push({
+        pageKey: pk,
+        pageNum,
+        label: "List",
+        confPct: c * 100,
+        targetPid: pid,
+        box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+      });
+    }
+
+    // -----------------
+    // TABLE blocks (class === "table")
+    // -----------------
+    const tables: any[] = Array.isArray(pageObj.tables) ? pageObj.tables : [];
+    for (let tIdx = 0; tIdx < tables.length; tIdx++) {
+      const tbl: any = tables[tIdx];
+      const cls = String(tbl?.class ?? "");
+      if (cls !== "table") continue;
+
+      const c = Number(tbl?.confidence);
+      if (!Number.isFinite(c) || c >= TH) continue;
+
+      const pid = `table-${tIdx}`;
+
+      let nb:
+        | { x: number; y: number; w: number; h: number; area: number }
+        | null = null;
+
+      if (Array.isArray(tbl?.bbox) && tbl.bbox.length === 4) {
+        nb = normBoxFromPixels(tbl.bbox as [number, number, number, number], pageW, pageH);
+      } else {
+        const linesInTable: any[] = Array.isArray(tbl?.lines) ? tbl.lines : [];
+        let minX = 1,
+          minY = 1,
+          maxX = 0,
+          maxY = 0;
+        let found = false;
+
+        for (const ln of linesInTable) {
+          const bb = Array.isArray(ln?.bbox) ? (ln.bbox as [number, number, number, number]) : null;
+          if (!bb) continue;
+          const t = normBoxFromPixels(bb, pageW, pageH);
+          if (!t) continue;
+          found = true;
+          minX = Math.min(minX, t.x);
+          minY = Math.min(minY, t.y);
+          maxX = Math.max(maxX, t.x + t.w);
+          maxY = Math.max(maxY, t.y + t.h);
+        }
+
+        if (found) {
+          const w = Math.max(0, maxX - minX);
+          const h = Math.max(0, maxY - minY);
+          if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
+        }
+      }
+
+      out.push({
+        pageKey: pk,
+        pageNum,
+        label: "Table",
+        confPct: c * 100,
+        targetPid: pid,
+        box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+      });
+    }
+  }
+
+  // Sort: page asc, then Paragraph/List/Table, then lowest confidence first
+  out.sort((a, b) => {
+    const ap = a.pageNum ?? 1e9;
+    const bp = b.pageNum ?? 1e9;
+    if (ap !== bp) return ap - bp;
+
+    const order = (lbl: string) => (lbl === "Paragraph" ? 0 : lbl === "List" ? 1 : 2);
+    const ao = order(a.label);
+    const bo = order(b.label);
+    if (ao !== bo) return ao - bo;
+
+    return a.confPct - b.confPct;
+  });
+
+  return out;
+}, [doc]);
+
+  const lowConfByPid = useMemo(() => {
+    const by: Record<
+      string,
+      { label: string; confPct: number; predicted_class: string; predicted_confidence: number }
+    > = {};
+
+    for (const it of lowConfItems) {
+      if (!pageKey || it.pageKey !== pageKey) continue;
+      by[it.targetPid] = {
+        label: it.label,
+        confPct: it.confPct,
+        predicted_class: it.label,
+        predicted_confidence: Math.max(0, Math.min(1, it.confPct / 100)),
+      };
+    }
+
+    return by;
+  }, [lowConfItems, pageKey]);
 
   useEffect(() => {
     // These stats are shown on the welcome page as soon as we have the JSON/PDF.
@@ -443,6 +884,125 @@ export default function Home() {
     setSuggestComment("");
     await loadSuggestionsForPage(DOCUMENT_ID, pageKey);
   }
+
+useEffect(() => {
+  if (!supabase) return;
+  if (!DOCUMENT_ID) return;
+
+  let cancelled = false;
+
+  (async () => {
+    try {
+      const { data, error } = await supabase
+        .from("low_conf_labels")
+        .select(
+          "id,document_id,page_key,target_pid,predicted_class,predicted_confidence,corrected_class,other_text,user_id,author_username,updated_at"
+        )
+        .eq("document_id", DOCUMENT_ID)
+        .limit(10000);
+
+      if (error) throw error;
+      if (cancelled) return;
+
+      const next: Record<
+        string,
+        {
+          corrected_class: "Paragraph" | "List" | "Table" | "Other";
+          other_text: string;
+          author_username?: string;
+          user_id?: string;
+          updated_at?: string;
+        }
+      > = {};
+
+      for (const r of (data ?? []) as any[]) {
+        const pk = String(r?.page_key ?? "");
+        const tp = String(r?.target_pid ?? "");
+        if (!pk || !tp) continue;
+
+        const key = `${pk}|${tp}`;
+        const cls = String(r?.corrected_class ?? "Other") as any;
+
+        next[key] = {
+          corrected_class: cls,
+          other_text: String(r?.other_text ?? ""),
+          author_username: String(r?.author_username ?? "") || undefined,
+          user_id: String(r?.user_id ?? "") || undefined,
+          updated_at: String(r?.updated_at ?? "") || undefined,
+        };
+      }
+
+      setLowConfLabelsByKey(next);
+    } catch (e) {
+      console.warn("low_conf_labels load failed", e);
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [supabase, DOCUMENT_ID]);
+
+
+
+
+  async function saveLowConfLabel(args: {
+    page_key: string;
+    target_pid: string;
+    predicted_class: string;
+    predicted_confidence: number; // 0..1
+    corrected_class: "Paragraph" | "List" | "Table" | "Other";
+    other_text: string;
+  }) {
+    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
+    if (!DOCUMENT_ID) return alert("Missing NEXT_PUBLIC_DOCUMENT_ID in .env.local");
+    if (!user) return alert("Please sign in to save labels.");
+
+    const unameSnapshot =
+      (usernameByUserId[user.id] && usernameByUserId[user.id].trim()) ||
+      (user.email ? user.email.split("@")[0] : "") ||
+      `user_${user.id.slice(0, 6)}`;
+
+    const payload = {
+      document_id: DOCUMENT_ID,
+      page_key: args.page_key,
+      target_pid: args.target_pid,
+      predicted_class: args.predicted_class,
+      predicted_confidence: args.predicted_confidence,
+      corrected_class: args.corrected_class,
+      other_text: args.other_text ? args.other_text.trim() : null,
+      user_id: user.id,
+      author_username: unameSnapshot,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("low_conf_labels")
+      .upsert(payload, { onConflict: "document_id,page_key,target_pid" })
+      .select("page_key,target_pid,corrected_class,other_text,user_id,author_username,updated_at")
+      .maybeSingle();
+
+    if (error) {
+      console.warn("low_conf_labels upsert failed", error);
+      return alert(error.message);
+    }
+
+    const key = `${args.page_key}|${args.target_pid}`;
+    setLowConfLabelsByKey((prev) => ({
+      ...prev,
+      [key]: {
+        corrected_class: (data?.corrected_class ?? args.corrected_class) as any,
+        other_text: String(data?.other_text ?? args.other_text ?? ""),
+        author_username: String(data?.author_username ?? unameSnapshot) || undefined,
+        user_id: String(data?.user_id ?? user.id) || undefined,
+        updated_at: String(data?.updated_at ?? payload.updated_at) || undefined,
+      },
+    }));
+  }
+
+
+
 
   async function ensureProfileUsername(userId: string, fallbackEmail?: string | null) {
     if (!supabase) return;
@@ -635,6 +1195,7 @@ export default function Home() {
     window.addEventListener("popstate", syncFromUrl);
     return () => window.removeEventListener("popstate", syncFromUrl);
   }, []);
+
 
   async function loadDocAndPdf() {
     if (!PDF_URL || !JSON_URL) {
@@ -1147,47 +1708,198 @@ export default function Home() {
 
 
 
-      // Build paragraph-level boxes + text (for paragraph transcription mode)
-      const parItems: Array<{ pid: string; text: string; box: { x: number; y: number; w: number; h: number } }> = [];
-      const pars = pageObj?.paragraphs || [];
-      const pageW = pageObj!.width;
-      const pageH = pageObj!.height;
 
-      for (let pIdx = 0; pIdx < pars.length; pIdx++) {
-        const par: any = pars[pIdx];
-        const linesInPar: any[] = Array.isArray(par?.lines) ? par.lines : [];
 
-        let minX = 1, minY = 1, maxX = 0, maxY = 0;
-        let found = false;
 
-        for (const ln of linesInPar) {
-          const nb = normBoxFromPixels(ln.bbox, pageW, pageH);
-          if (!nb) continue;
-          found = true;
-          minX = Math.min(minX, nb.x);
-          minY = Math.min(minY, nb.y);
-          maxX = Math.max(maxX, nb.x + nb.w);
-          maxY = Math.max(maxY, nb.y + nb.h);
-        }
 
-        if (!found) continue;
 
-        minX = Math.min(1, Math.max(0, minX));
-        minY = Math.min(1, Math.max(0, minY));
-        maxX = Math.min(1, Math.max(0, maxX));
-        maxY = Math.min(1, Math.max(0, maxY));
 
-        const box = { x: minX, y: minY, w: Math.max(0, maxX - minX), h: Math.max(0, maxY - minY) };
-        if (box.w <= 0 || box.h <= 0) continue;
 
-        const llmText = (par?.llm_text ?? "").toString().trim();
-        const fallbackText = (linesInPar || []).map((x: any) => String(x?.transcription ?? "")).join("\n").trim();
-        const text = llmText || fallbackText;
+     // Build paragraph/list/table-level boxes + text (for paragraph transcription mode)
+    // IMPORTANT: keep items in page reading order by sorting by their top-left bbox.
+    const parItems: Array<{ pid: string; text: string; box: { x: number; y: number; w: number; h: number } }> = [];
+    const pars = pageObj?.paragraphs || [];
+    const pageW = pageObj!.width;
+    const pageH = pageObj!.height;
 
-        parItems.push({ pid: `p-${pIdx}`, text, box });
+    // Helper: get a normalized box from a block-like object.
+    // Prefer pixel bbox if present; fall back to bboxn if present.
+    const normBoxFromAny = (blk: any): { x: number; y: number; w: number; h: number } | null => {
+      if (!blk) return null;
+
+      // Prefer pixel bbox
+      if (Array.isArray(blk.bbox) && blk.bbox.length === 4) {
+        const nb = normBoxFromPixels(blk.bbox as any, pageW, pageH);
+        if (nb) return { x: nb.x, y: nb.y, w: nb.w, h: nb.h };
       }
 
-      setParagraphItems(parItems);
+      // Fall back to normalized bbox
+      if (Array.isArray(blk.bboxn) && blk.bboxn.length === 4) {
+        const [x1n, y1n, x2n, y2n] = blk.bboxn as any;
+        if (![x1n, y1n, x2n, y2n].every((v) => Number.isFinite(v))) return null;
+
+        const x1 = Math.min(1, Math.max(0, Math.min(x1n, x2n)));
+        const x2 = Math.min(1, Math.max(0, Math.max(x1n, x2n)));
+        const y1 = Math.min(1, Math.max(0, Math.min(y1n, y2n)));
+        const y2 = Math.min(1, Math.max(0, Math.max(y1n, y2n)));
+
+        const w = Math.max(0, x2 - x1);
+        const h = Math.max(0, y2 - y1);
+        if (w <= 0 || h <= 0) return null;
+
+        return { x: x1, y: y1, w, h };
+      }
+
+      return null;
+    };
+
+    // 1) Paragraphs (existing behavior)
+    for (let pIdx = 0; pIdx < pars.length; pIdx++) {
+      const par: any = pars[pIdx];
+      const linesInPar: any[] = Array.isArray(par?.lines) ? par.lines : [];
+
+      let minX = 1, minY = 1, maxX = 0, maxY = 0;
+      let found = false;
+
+      for (const ln of linesInPar) {
+        const nb = normBoxFromPixels(ln.bbox, pageW, pageH);
+        if (!nb) continue;
+        found = true;
+        minX = Math.min(minX, nb.x);
+        minY = Math.min(minY, nb.y);
+        maxX = Math.max(maxX, nb.x + nb.w);
+        maxY = Math.max(maxY, nb.y + nb.h);
+      }
+
+      if (!found) continue;
+
+      minX = Math.min(1, Math.max(0, minX));
+      minY = Math.min(1, Math.max(0, minY));
+      maxX = Math.min(1, Math.max(0, maxX));
+      maxY = Math.min(1, Math.max(0, maxY));
+
+      const box = { x: minX, y: minY, w: Math.max(0, maxX - minX), h: Math.max(0, maxY - minY) };
+      if (box.w <= 0 || box.h <= 0) continue;
+
+      const llmText = (par?.llm_text ?? "").toString().trim();
+      const fallbackText = (linesInPar || [])
+        .map((x: any) => String(x?.transcription ?? ""))
+        .join("\n")
+        .trim();
+      const text = llmText || fallbackText;
+
+      parItems.push({ pid: `p-${pIdx}`, text, box });
+    }
+
+    // 2) Lists (if present in JSON)
+    // Robust: your JSON may call it `lists` or `list`.
+    const listsAny: any[] = Array.isArray((pageObj as any)?.lists)
+      ? (pageObj as any).lists
+      : Array.isArray((pageObj as any)?.list)
+      ? (pageObj as any).list
+      : [];
+
+    for (let i = 0; i < listsAny.length; i++) {
+      const blk: any = listsAny[i];
+      const box = normBoxFromAny(blk);
+      if (!box) continue;
+
+      const llmText = (blk?.llm_text ?? blk?.text ?? "").toString().trim();
+      const items = Array.isArray(blk?.items) ? blk.items : Array.isArray(blk?.lines) ? blk.lines : [];
+      const fallback = Array.isArray(items)
+        ? items
+            .map((x: any) => {
+              if (typeof x === "string") return x;
+              return String(x?.text ?? x?.transcription ?? "");
+            })
+            .filter((s: string) => s.trim().length)
+            .join("\n")
+            .trim()
+        : "";
+
+      const text = llmText || fallback || "(List)";
+      parItems.push({ pid: `list-${i}`, text, box });
+    }
+
+    // 3) Tables (if present in JSON)
+    const tablesAny: any[] = Array.isArray((pageObj as any)?.tables)
+      ? (pageObj as any).tables
+      : Array.isArray((pageObj as any)?.table)
+      ? (pageObj as any).table
+      : [];
+
+    for (let i = 0; i < tablesAny.length; i++) {
+      const blk: any = tablesAny[i];
+      const box = normBoxFromAny(blk);
+      if (!box) continue;
+
+      const llmText = (blk?.llm_text ?? blk?.text ?? "").toString().trim();
+
+      // Try to build a readable fallback from common table shapes
+      let fallback = "";
+      const rows = Array.isArray(blk?.rows) ? blk.rows : Array.isArray(blk?.data) ? blk.data : null;
+      if (rows && Array.isArray(rows)) {
+        fallback = rows
+          .map((r: any) => {
+            if (Array.isArray(r)) return r.map((c) => String(c ?? "").trim()).filter(Boolean).join("\t");
+            if (typeof r === "object" && r) {
+              return Object.keys(r)
+                .sort()
+                .map((k) => String(r[k] ?? "").trim())
+                .filter(Boolean)
+                .join("\t");
+            }
+            return String(r ?? "").trim();
+          })
+          .filter((s: string) => s.trim().length)
+          .join("\n")
+          .trim();
+      }
+
+      const text = llmText || fallback || "(Table)";
+      parItems.push({ pid: `table-${i}`, text, box });
+    }
+
+    // Sort ALL items by reading order.
+    // If the PDF page is actually a 2-page spread (left page + right page scanned together),
+    // order by page-half first (left half, then right half), then by y then x.
+    // Otherwise, order by y then x.
+
+    const centers: number[] = parItems
+      .map((it) => it.box.x + it.box.w * 0.5)
+      .filter((v) => Number.isFinite(v));
+
+    let isTwoPageSpread = false;
+    if (centers.length >= 6) {
+      const leftCount = centers.filter((c) => c < 0.45).length;
+      const rightCount = centers.filter((c) => c > 0.55).length;
+      const fracLeft = leftCount / centers.length;
+      const fracRight = rightCount / centers.length;
+      if (fracLeft > 0.20 && fracRight > 0.20) isTwoPageSpread = true;
+    }
+
+    parItems.sort((a, b) => {
+      const aCenter = a.box.x + a.box.w * 0.5;
+      const bCenter = b.box.x + b.box.w * 0.5;
+
+      if (isTwoPageSpread) {
+        const halfA = aCenter < 0.5 ? 0 : 1;
+        const halfB = bCenter < 0.5 ? 0 : 1;
+        if (halfA !== halfB) return halfA - halfB; // left half first
+      }
+
+      const dy = a.box.y - b.box.y;
+      if (Math.abs(dy) > 0.002) return dy;
+
+      const dx = a.box.x - b.box.x;
+      if (Math.abs(dx) > 0.002) return dx;
+
+      // Stable tie-breaker
+      return String(a.pid).localeCompare(String(b.pid));
+    });
+
+    setParagraphItems(parItems);
+
 
       if (scroller && prevScroll) {
         requestAnimationFrame(() => {
@@ -1214,9 +1926,30 @@ export default function Home() {
   }, [doc, pdf, pageKey, zoom, pdfViewportWidth, viewMode]);
 
 
+  // Apply a pending Low Confidence jump after the page has rendered its boxes
   useEffect(() => {
+    if (!pendingLowConfJump) return;
+    if (!pageKey || pendingLowConfJump.pageKey !== pageKey) return;
+
+    // Switch to paragraph mode so p-#/list-#/table-# targets exist
+    setTranscriptionMode("paragraph");
+
+    setActiveSource("menu");
+    setActiveParagraphId(pendingLowConfJump.targetPid);
+    setActiveId(null);
+    setActiveBox(pendingLowConfJump.box);
+
+    // Ensure community suggestions visible for the target
+    setCollapseSuggestions(false);
+
+    // Clear once applied
+    setPendingLowConfJump(null);
+  }, [pendingLowConfJump, pageKey]);
+
+  useEffect(() => {
+    if (!autoScrollEnabled) return;
     if (!activeParagraphId) return;
-    if (activeSource !== "left") return;
+    if (activeSource !== "left" && activeSource !== "menu") return;
 
     const el = paragraphElByIdRef.current[String(activeParagraphId)];
     const container = rightScrollRef.current;
@@ -1235,6 +1968,31 @@ export default function Home() {
 
     container.scrollTo({ top: targetTop, behavior: "smooth" });
   }, [activeParagraphId, activeSource]);
+
+  // Auto-scroll: when hovering/clicking a LINE on the LEFT (PDF), center the matching line on the RIGHT.
+  useEffect(() => {
+    if (!autoScrollEnabled) return;
+    if (!activeId) return;
+    if (activeSource !== "left" && activeSource !== "menu") return;
+
+    const el = lineElByIdRef.current[String(activeId)];
+    const container = rightScrollRef.current;
+    if (!el || !container) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+
+    const offsetTop = elRect.top - containerRect.top;
+
+    // Center the line within the right panel
+    const targetTop =
+      container.scrollTop +
+      offsetTop -
+      container.clientHeight / 2 +
+      el.clientHeight / 2;
+
+    container.scrollTo({ top: targetTop, behavior: "smooth" });
+  }, [activeId, activeSource]);
 
   // ------------------------------
   // Point-based hit-testing (PDF image -> transcript)
@@ -1887,6 +2645,132 @@ export default function Home() {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ position: "relative" }}>
+            <button
+              type="button"
+              onClick={() => setShowLowConfidenceMenu((v) => !v)}
+              style={btnBase}
+              onMouseDown={preventMouseDownFocus}
+              onFocus={blurOnFocus}
+              onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+              onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+              aria-expanded={showLowConfidenceMenu}
+              title="Pages/blocks where class confidence is below 50"
+            >
+              Low Confidence Pages{lowConfItems.length ? ` (${lowConfItems.length})` : ""}
+            </button>
+
+            {showLowConfidenceMenu ? (
+              <div
+                onMouseDown={(e) => e.stopPropagation()}
+                style={{
+                  position: "absolute",
+                  right: 0,
+                  top: "calc(100% + 8px)",
+                  width: "min(360px, 92vw)",
+                  maxHeight: 360,
+                  overflow: "auto",
+                  border: "1px solid rgba(0,0,0,0.12)",
+                  borderRadius: 14,
+                  background: "rgba(255,255,255,0.98)",
+                  boxShadow: "0 18px 50px rgba(0,0,0,0.18)",
+                  padding: 10,
+                  zIndex: 9999,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                  <div style={{ fontWeight: 900, fontSize: 13, opacity: 0.85 }}>Low confidence blocks</div>
+                  <button
+                    type="button"
+                    onClick={() => setShowLowConfidenceMenu(false)}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 12,
+                      border: "1px solid rgba(0,0,0,0.18)",
+                      background: "white",
+                      cursor: "pointer",
+                      fontWeight: 800,
+                      outline: "none",
+                      appearance: "none",
+                    }}
+                    onMouseDown={preventMouseDownFocus}
+                    onFocus={blurOnFocus}
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+                  {lowConfItems.length ? (
+                    lowConfItems.map((it, idx) => (
+                <div
+                  key={`${it.pageKey}|${it.targetPid}`}
+                  onClick={() => {
+                    setShowLowConfidenceMenu(false);
+
+                    if (it.pageKey !== pageKey) {
+                      setPageKey(it.pageKey);
+                    }
+
+                    setPendingLowConfJump({
+                      pageKey: it.pageKey,
+                      targetPid: it.targetPid,
+                      box: it.box || { x: 0, y: 0, w: 0, h: 0 },
+                    });
+                  }}
+                  style={{
+                    padding: 12,
+                    borderRadius: 12,
+                    border: "1px solid rgba(0,0,0,0.10)",
+                    background: "white",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 12,
+                        width: "100%",
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontWeight: 900,
+                          fontSize: 14,
+                          minWidth: 0,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        Page {it.pageNum ?? ""} • {it.label}
+                      </div>
+
+                      <div
+                        style={{
+                          fontWeight: 900,
+                          fontSize: 14,
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {Math.round(it.confPct)}%
+                      </div>
+                    </div>
+                    </div>
+                    ))
+                  ) : (
+                    <div style={{ fontSize: 13, opacity: 0.75 }}>No low-confidence paragraph/list/table blocks found.</div>
+                  )}
+                </div>
+              </div>
+            ) : null}
+          </div>
           {!user ? (
             <>
               <button
@@ -2173,6 +3057,27 @@ export default function Home() {
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <button
                 type="button"
+                onClick={() => setAutoScrollEnabled((v) => !v)}
+                style={{
+                  ...btnBase,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  fontWeight: 900,
+                  border: "1px solid rgba(0,0,0,0.14)",
+                  background: autoScrollEnabled ? "white" : "rgba(0,0,0,0.05)",
+                  opacity: autoScrollEnabled ? 1 : 0.85,
+                }}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
+                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                aria-pressed={autoScrollEnabled}
+                title="Toggle auto-scrolling of the right panel when hovering the PDF"
+              >
+                Auto-scroll: {autoScrollEnabled ? "On" : "Off"}
+              </button>
+              <button
+                type="button"
                 onClick={() => setTranscriptionMode("lines")}
                 aria-pressed={transcriptionMode === "lines"}
                 style={{
@@ -2222,6 +3127,15 @@ export default function Home() {
             <div style={{ display: "grid", gap: 10, fontSize: 16 }}>
               {paragraphItems.map((p) => {
                 const isActive = activeParagraphId === p.pid;
+                const lowMeta = lowConfByPid[p.pid];
+                const isLowConf = !!lowMeta;
+                const lowKey = `${pageKey}|${p.pid}`;
+
+                const saved = lowConfLabelsByKey[lowKey];
+                const draft = lowConfDraftByKey[lowKey] || {
+                  corrected_class: saved?.corrected_class || "Paragraph",
+                  other_text: saved?.other_text || "",
+                };
                 return (
                   <div
                     key={p.pid}
@@ -2251,12 +3165,41 @@ export default function Home() {
                       lineHeight: 1.35,
                       cursor: "pointer",
                       border: "1px solid rgba(0,0,0,0.06)",
-                      background: isActive ? "rgba(255,242,168,0.75)" : "transparent",
+                      background: isActive
+                        ? "rgba(255,242,168,0.75)"
+                        : isLowConf
+                        ? "rgba(255,242,168,0.28)"
+                        : "transparent",
                       boxShadow: "none",
                       fontFamily: "Georgia, 'Times New Roman', serif",
                       fontSize: 15,
                     }}
                   >
+                    {/* Always-visible low-confidence badge */}
+                    {isLowConf ? (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 10,
+                          marginBottom: 6,
+                          padding: "6px 10px",
+                          borderRadius: 12,
+                          border: "1px solid rgba(255, 200, 0, 0.35)",
+                          background: "rgba(255, 242, 168, 0.22)",
+                          fontFamily: "ui-sans-serif, system-ui",
+                        }}
+                      >
+                        <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(120,80,0,0.92)" }}>
+                          Low confidence • {Math.round((lowMeta?.confPct ?? 0))}%
+                        </div>
+                        <div style={{ fontSize: 12, opacity: 0.7, whiteSpace: "nowrap" }}>
+                          {lowMeta?.predicted_class ? String(lowMeta.predicted_class) : ""}
+                        </div>
+                      </div>
+                    ) : null}
+
                     <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
                       <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>{p.text}</div>
                       <button
@@ -2290,6 +3233,119 @@ export default function Home() {
                         <PencilGlyph size={16} />
                       </button>
                     </div>
+
+                    {/* Low-confidence dropdown editor: only show when active AND low confidence */}
+                    {isActive && isLowConf ? (
+                      <div
+                        style={{
+                          marginTop: 10,
+                          padding: 10,
+                          borderRadius: 12,
+                          border: "1px solid rgba(255, 200, 0, 0.45)",
+                          background: "rgba(255, 242, 168, 0.25)",
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                          <div style={{ fontWeight: 900, fontSize: 13 }}>
+                            Low confidence • {Math.round(lowMeta.confPct)}%
+                          </div>
+                          {saved?.updated_at ? (
+                            <div style={{ fontSize: 12, opacity: 0.65, whiteSpace: "nowrap" }}>saved</div>
+                          ) : null}
+                        </div>
+
+                        <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 10, flexWrap: "wrap" }}>
+                          <div style={{ fontSize: 12, opacity: 0.75 }}>This is actually:</div>
+
+                          <select
+                            value={draft.corrected_class}
+                            onChange={(e) => {
+                              const v = e.target.value as any;
+                              setLowConfDraftByKey((prev) => ({
+                                ...prev,
+                                [lowKey]: {
+                                  corrected_class: v,
+                                  other_text: v === "Other" ? (draft.other_text || "") : "",
+                                },
+                              }));
+                            }}
+                            style={{
+                              padding: "6px 10px",
+                              borderRadius: 10,
+                              border: "1px solid rgba(0,0,0,0.15)",
+                              background: "white",
+                              fontWeight: 800,
+                              fontSize: 12,
+                              cursor: "pointer",
+                            }}
+                          >
+                            <option value="Paragraph">Paragraph</option>
+                            <option value="List">List</option>
+                            <option value="Table">Table</option>
+                            <option value="Other">Other</option>
+                          </select>
+
+                          {draft.corrected_class === "Other" ? (
+                            <input
+                              value={draft.other_text}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setLowConfDraftByKey((prev) => ({
+                                  ...prev,
+                                  [lowKey]: { corrected_class: "Other", other_text: v },
+                                }));
+                              }}
+                              placeholder="What is it?"
+                              style={{
+                                flex: "1 1 220px",
+                                minWidth: 180,
+                                padding: "6px 10px",
+                                borderRadius: 10,
+                                border: "1px solid rgba(0,0,0,0.15)",
+                              }}
+                            />
+                          ) : null}
+
+                          <button
+                            type="button"
+                            disabled={!user || !!isSavingLowConf[lowKey]}
+                            onClick={async () => {
+                              if (!user) return alert("Please sign in to save labels.");
+
+                              setIsSavingLowConf((prev) => ({ ...prev, [lowKey]: true }));
+                              try {
+                                await saveLowConfLabel({
+                                  page_key: pageKey,
+                                  target_pid: p.pid,
+                                  predicted_class: lowMeta.predicted_class,
+                                  predicted_confidence: lowMeta.predicted_confidence,
+                                  corrected_class: draft.corrected_class,
+                                  other_text: draft.other_text || "",
+                                });
+                              } finally {
+                                setIsSavingLowConf((prev) => ({ ...prev, [lowKey]: false }));
+                              }
+                            }}
+                            style={{
+                              padding: "6px 10px",
+                              fontSize: 12,
+                              borderRadius: 10,
+                              border: "1px solid rgba(0,0,0,0.18)",
+                              background: !user ? "rgba(0,0,0,0.06)" : "white",
+                              cursor: !user ? "not-allowed" : "pointer",
+                              fontWeight: 900,
+                              opacity: !user ? 0.65 : 1,
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {isSavingLowConf[lowKey] ? "Saving…" : "Save"}
+                          </button>
+
+                          {!user ? <div style={{ fontSize: 12, opacity: 0.7 }}>Sign in to save.</div> : null}
+                        </div>
+                      </div>
+                    ) : null}
 
                     {openSuggestUid === p.pid ? (
                       <div style={{ marginTop: 10 }} onClick={(e) => e.stopPropagation()}>
