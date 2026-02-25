@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { WheelEventHandler, MouseEventHandler } from "react";
 import { createClient } from "@supabase/supabase-js";
 
@@ -66,6 +66,8 @@ type LowConfLabelRow = {
   predicted_confidence?: number | null;
   corrected_class: "Paragraph" | "List" | "Table" | "Other";
   other_text?: string | null;
+  corrected_bbox?: [number, number, number, number] | null;
+  corrected_bboxn?: [number, number, number, number] | null;
   user_id?: string | null;
   author_username?: string | null;
   updated_at?: string | null;
@@ -78,8 +80,30 @@ type MapDoc = {
   lng: number;
 };
 
+type MapDocOption = { id: string; title: string };
+
+type DocLocation = {
+  id: string;
+  document_id: string;
+  seq: number;
+  label: string | null;
+  lat: number;
+  lng: number;
+  note: string | null;
+};
+
+type AggregatedLocation = {
+  key: string;
+  lat: number;
+  lng: number;
+  doc_count: number; // number of DISTINCT documents at this location
+  doc_ids: string[];
+  doc_titles: string[];
+};
+
 function pageKeyToNumber(pageKey: string) {
-  const m = pageKey.match(/_page_(\d+)$/);
+  // Supports both JSON keys like "..._page_12" and PDF-only keys like "pdf_only_page_12"
+  const m = pageKey.match(/(?:^|_)page_(\d+)$/);
   return m ? parseInt(m[1], 10) : null;
 }
 function getAllLinesForPage(p: PageObj): LineWithUid[] {
@@ -123,7 +147,8 @@ function getAllLinesForPage(p: PageObj): LineWithUid[] {
     const y1 = Number(bb[1]);
     const x2 = Number(bb[2]);
     const y2 = Number(bb[3]);
-    if (![x1, y1, x2, y2, pageW, pageH].every((v) => Number.isFinite(v))) return null;
+    if (![x1, y1, x2, y2, pageW, pageH].every((v) => Number.isFinite(v)))
+      return null;
     if (pageW <= 0 || pageH <= 0) return null;
 
     // normalize
@@ -149,7 +174,7 @@ function getAllLinesForPage(p: PageObj): LineWithUid[] {
     const fracLeft = leftCount / centers.length;
     const fracRight = rightCount / centers.length;
     // require both sides to have substantial content
-    if (fracLeft > 0.20 && fracRight > 0.20) isTwoPageSpread = true;
+    if (fracLeft > 0.2 && fracRight > 0.2) isTwoPageSpread = true;
   }
 
   out.sort((a, b) => {
@@ -189,23 +214,34 @@ export default function Home() {
 
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [started, setStarted] = useState(false);
-  const [welcomeStats, setWelcomeStats] = useState<{ pages: number | null; lines: number | null; volunteers: number | null }>(
-    { pages: null, lines: null, volunteers: null }
-  );
+  const [welcomeStats, setWelcomeStats] = useState<{
+    pages: number | null;
+    lines: number | null;
+    volunteers: number | null;
+  }>({ pages: null, lines: null, volunteers: null });
 
-  const [transcriptionMode, setTranscriptionMode] = useState<"lines" | "paragraph">("lines");
-  const [activeParagraphId, setActiveParagraphId] = useState<string | null>(null);
+  const [transcriptionMode, setTranscriptionMode] = useState<
+    "lines" | "paragraph"
+  >("lines");
+  const [activeParagraphId, setActiveParagraphId] = useState<string | null>(
+    null,
+  );
   const [paragraphItems, setParagraphItems] = useState<
-    Array<{ pid: string; text: string; box: { x: number; y: number; w: number; h: number } }>
+    Array<{
+      pid: string;
+      text: string;
+      box: { x: number; y: number; w: number; h: number };
+    }>
   >([]);
 
   function normBoxFromPixels(
-  bbox: [number, number, number, number],
-  pageW: number,
-  pageH: number
+    bbox: [number, number, number, number],
+    pageW: number,
+    pageH: number,
   ): { x: number; y: number; w: number; h: number; area: number } | null {
     const [x1p, y1p, x2p, y2p] = bbox;
-    if (![x1p, y1p, x2p, y2p, pageW, pageH].every((v) => Number.isFinite(v))) return null;
+    if (![x1p, y1p, x2p, y2p, pageW, pageH].every((v) => Number.isFinite(v)))
+      return null;
     if (pageW <= 0 || pageH <= 0) return null;
 
     let x1n = x1p / pageW;
@@ -251,25 +287,33 @@ export default function Home() {
   const [signupEmail, setSignupEmail] = useState("");
   const [signupUsername, setSignupUsername] = useState("");
   const [signupPw, setSignupPw] = useState("");
-  const [user, setUser] = useState<{ id: string; email: string | null } | null>(null);
+  const [user, setUser] = useState<{ id: string; email: string | null } | null>(
+    null,
+  );
   const [documentTitle, setDocumentTitle] = useState<string>("");
 
   // Suggestions (grouped by uid)
-  const [suggestionsByUid, setSuggestionsByUid] = useState<Record<string, SuggestionRow[]>>({});
+  const [suggestionsByUid, setSuggestionsByUid] = useState<
+    Record<string, SuggestionRow[]>
+  >({});
   const [openSuggestUid, setOpenSuggestUid] = useState<string | null>(null);
   const [suggestText, setSuggestText] = useState<string>("");
   const [suggestComment, setSuggestComment] = useState<string>("");
   const [isLoadingSuggestions, setIsLoadingSuggestions] = useState(false);
   const [collapseSuggestions, setCollapseSuggestions] = useState(false);
   const [collapsedUid, setCollapsedUid] = useState<Record<string, boolean>>({});
-  const [sortModeByUid, setSortModeByUid] = useState<Record<string, "top" | "newest">>({});
+  const [sortModeByUid, setSortModeByUid] = useState<
+    Record<string, "top" | "newest">
+  >({});
   const [hoverVoteId, setHoverVoteId] = useState<string | null>(null);
-  const [usernameByUserId, setUsernameByUserId] = useState<Record<string, string>>({});
+  const [usernameByUserId, setUsernameByUserId] = useState<
+    Record<string, string>
+  >({});
 
   const [showLeaderboard, setShowLeaderboard] = useState(false);
-  const [leaderboardRows, setLeaderboardRows] = useState<Array<{ user_id: string; username: string; upvotes: number }>>(
-    []
-  );
+  const [leaderboardRows, setLeaderboardRows] = useState<
+    Array<{ user_id: string; username: string; upvotes: number }>
+  >([]);
   const [isLoadingLeaderboard, setIsLoadingLeaderboard] = useState(false);
 
   const [viewMode, setViewMode] = useState<"viewer" | "map">("viewer");
@@ -279,11 +323,28 @@ export default function Home() {
   const mapDivRef = useRef<HTMLDivElement | null>(null);
   const leafletMapRef = useRef<any>(null);
   const leafletLayerRef = useRef<any>(null);
+  const leafletPolylineRef = useRef<any>(null);
+  const [mapDocOptions, setMapDocOptions] = useState<MapDocOption[]>([]);
+  const [selectedMapDocId, setSelectedMapDocId] = useState<string>("");
+  const [mapLocations, setMapLocations] = useState<DocLocation[]>([]);
+  const [mapAggLocations, setMapAggLocations] = useState<AggregatedLocation[]>(
+    [],
+  );
+  const [viewerLocations, setViewerLocations] = useState<DocLocation[]>([]);
+
+  const [showAddLocation, setShowAddLocation] = useState(false);
+  const [locLabel, setLocLabel] = useState<string>("");
+  const [locLat, setLocLat] = useState<string>("");
+  const [locLng, setLocLng] = useState<string>("");
+  const [locNote, setLocNote] = useState<string>("");
+  const [isSavingLocation, setIsSavingLocation] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const hitSvgRef = useRef<SVGSVGElement | null>(null);
   const highlightSvgRef = useRef<SVGSVGElement | null>(null);
-  const boxByUidRef = useRef<Record<string, { x: number; y: number; w: number; h: number }>>({});
+  const boxByUidRef = useRef<
+    Record<string, { x: number; y: number; w: number; h: number }>
+  >({});
   const renderTaskRef = useRef<any>(null);
   const pdfScrollRef = useRef<HTMLDivElement | null>(null);
   const rightScrollRef = useRef<HTMLDivElement | null>(null);
@@ -292,58 +353,166 @@ export default function Home() {
 
   const lineElByIdRef = useRef<Record<string, HTMLDivElement | null>>({});
   const paragraphElByIdRef = useRef<Record<string, HTMLDivElement | null>>({});
-  const [activeSource, setActiveSource] = useState<"left" | "right" | "menu" | null>(null);
+  const [activeSource, setActiveSource] = useState<
+    "left" | "right" | "menu" | null
+  >(null);
   const [autoScrollEnabled, setAutoScrollEnabled] = useState(true);
   const [showLowConfidenceMenu, setShowLowConfidenceMenu] = useState(false);
   const [lowConfLabelsByKey, setLowConfLabelsByKey] = useState<
-  Record<
-    string,
-    {
-      corrected_class: "Paragraph" | "List" | "Table" | "Other";
-      other_text: string;
-      author_username?: string;
-      user_id?: string;
-      updated_at?: string;
-    }
-  >
->({});
+    Record<
+      string,
+      {
+        corrected_class: "Paragraph" | "List" | "Table" | "Other";
+        other_text: string;
+        author_username?: string;
+        user_id?: string;
+        updated_at?: string;
+      }
+    >
+  >({});
 
-const [lowConfDraftByKey, setLowConfDraftByKey] = useState<
-  Record<string, { corrected_class: "Paragraph" | "List" | "Table" | "Other"; other_text: string }>
->({});
+  const [lowConfDraftByKey, setLowConfDraftByKey] = useState<
+    Record<
+      string,
+      {
+        corrected_class: "Paragraph" | "List" | "Table" | "Other";
+        other_text: string;
+      }
+    >
+  >({});
 
-const [isSavingLowConf, setIsSavingLowConf] = useState<Record<string, boolean>>({});
+  const [isSavingLowConf, setIsSavingLowConf] = useState<
+    Record<string, boolean>
+  >({});
 
-const lowConfMenuRef = useRef<HTMLDivElement | null>(null);
+  // ---- Low-confidence box drawing (user-corrected bbox) ----
+  const [isDrawingLowConfBox, setIsDrawingLowConfBox] = useState(false);
+  const drawStartRef = useRef<{ x: number; y: number } | null>(null);
+  const [drawPreviewBox, setDrawPreviewBox] = useState<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  } | null>(null);
+
+  // While in drawing mode (but not actively dragging), show hovered block bbox on the PDF
+  // WITHOUT changing the active selection/highlight on the right panel.
+  const [drawHoverBox, setDrawHoverBox] = useState<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  } | null>(null);
+
+  // Lock the current low-confidence block after the user starts drawing,
+  // until they explicitly Save or Cancel.
+  const [lowConfLockKey, setLowConfLockKey] = useState<string | null>(null);
+
+  const isLowConfLocked = !!lowConfLockKey || isDrawingLowConfBox;
+
+  // Remember what the box was BEFORE the user started drawing, so Cancel can revert.
+  const prevLowConfBoxRef = useRef<{
+    key: string | null;
+    box: { x: number; y: number; w: number; h: number } | null;
+  }>({ key: null, box: null });
+
+  // keyed by `${pageKey}|${targetPid}`
+  const [lowConfDrawnBoxByKey, setLowConfDrawnBoxByKey] = useState<
+    Record<string, { x: number; y: number; w: number; h: number }>
+  >({});
+
+  function beginLowConfLock(key: string) {
+    if (lowConfLockKey === key) return;
+
+    prevLowConfBoxRef.current = {
+      key,
+      box: lowConfDrawnBoxByKey[key] ?? null,
+    };
+
+    setLowConfLockKey(key);
+
+    // Scroll the locked block into view so the controls are visible
+    const pid = key.split("|")[1];
+    setTimeout(() => {
+      const el = paragraphElByIdRef.current[pid];
+      el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }, 0);
+  }
+
+  function clearLowConfLock() {
+    setLowConfLockKey(null);
+    prevLowConfBoxRef.current = { key: null, box: null };
+    setIsDrawingLowConfBox(false);
+    drawStartRef.current = null;
+    setDrawPreviewBox(null);
+    setDrawHoverBox(null);
+  }
+
+  function cancelLowConfLock(key: string) {
+    const prev = prevLowConfBoxRef.current;
+    const prevBox = prev.key === key ? prev.box : null;
+
+    setLowConfDrawnBoxByKey((cur) => {
+      const next = { ...cur };
+      if (prevBox) next[key] = prevBox;
+      else delete next[key];
+      return next;
+    });
+
+    clearLowConfLock();
+  }
+
+  const lowConfMenuRef = useRef<HTMLDivElement | null>(null);
+  const lowConfBtnRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!showLowConfidenceMenu) return;
 
-    const onDown = (e: MouseEvent) => {
+    const onWindowClick = (e: MouseEvent) => {
       const target = e.target as Node | null;
       const menuEl = lowConfMenuRef.current;
-      if (menuEl && target && menuEl.contains(target)) return; // click inside menu -> don't close
+      const btnEl = lowConfBtnRef.current;
+
+      // Click inside menu -> keep open
+      if (menuEl && target && menuEl.contains(target)) return;
+
+      // Click on the toggle button -> keep open (this is the click that opens it)
+      if (btnEl && target && btnEl.contains(target)) return;
+
       setShowLowConfidenceMenu(false);
     };
 
-    window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
+    // Use `click` so other header button onClick handlers still fire normally.
+    window.addEventListener("click", onWindowClick);
+    return () => window.removeEventListener("click", onWindowClick);
   }, [showLowConfidenceMenu]);
-  const [pendingLowConfJump, setPendingLowConfJump] = useState<
-    | null
-    | {
-        pageKey: string;
-        targetPid: string; // paragraph-mode pid: p-#, list-#, table-#
-        box: { x: number; y: number; w: number; h: number };
-      }
-  >(null);
+
+  const [pendingLowConfJump, setPendingLowConfJump] = useState<null | {
+    pageKey: string;
+    targetPid: string; // paragraph-mode pid: p-#, list-#, table-#
+    box: { x: number; y: number; w: number; h: number };
+  }>(null);
 
   const [doc, setDoc] = useState<DocJson | null>(null);
   const [pdf, setPdf] = useState<any>(null);
   const [pageKey, setPageKey] = useState<string>("");
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [activeBox, setActiveBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
-  const [hitBoxes, setHitBoxes] = useState<Array<{ uid: string; x: number; y: number; w: number; h: number; area: number }>>([]);
+  const [activeBox, setActiveBox] = useState<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  } | null>(null);
+  const [hitBoxes, setHitBoxes] = useState<
+    Array<{
+      uid: string;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      area: number;
+    }>
+  >([]);
   const hoverRafRef = useRef<number | null>(null);
   const hoverPtRef = useRef<{ x: number; y: number } | null>(null);
 
@@ -400,7 +569,8 @@ const lowConfMenuRef = useRef<HTMLDivElement | null>(null);
 
         // Release capture (best-effort)
         try {
-          if (pid != null) (e.currentTarget as HTMLDivElement).releasePointerCapture(pid);
+          if (pid != null)
+            (e.currentTarget as HTMLDivElement).releasePointerCapture(pid);
         } catch {}
 
         // Only close if:
@@ -415,7 +585,8 @@ const lowConfMenuRef = useRef<HTMLDivElement | null>(null);
         backdropClickRef.current.moved = false;
         backdropClickRef.current.pointerId = null;
         try {
-          if (pid != null) (e.currentTarget as HTMLDivElement).releasePointerCapture(pid);
+          if (pid != null)
+            (e.currentTarget as HTMLDivElement).releasePointerCapture(pid);
         } catch {}
       },
     };
@@ -441,7 +612,9 @@ const lowConfMenuRef = useRef<HTMLDivElement | null>(null);
     }
 
     // Otherwise, only show pages that exist in the JSON
-    return Object.keys(doc).sort((a, b) => (pageKeyToNumber(a) ?? 0) - (pageKeyToNumber(b) ?? 0));
+    return Object.keys(doc).sort(
+      (a, b) => (pageKeyToNumber(a) ?? 0) - (pageKeyToNumber(b) ?? 0),
+    );
   }, [doc, pdf]);
 
   function confToPct(c: any): number | null {
@@ -461,7 +634,11 @@ const lowConfMenuRef = useRef<HTMLDivElement | null>(null);
     for (const ln of lines || []) {
       const bb = ln?.bbox;
       if (!Array.isArray(bb) || bb.length !== 4) continue;
-      const nb = normBoxFromPixels(bb as [number, number, number, number], pageW, pageH);
+      const nb = normBoxFromPixels(
+        bb as [number, number, number, number],
+        pageW,
+        pageH,
+      );
       if (!nb) continue;
       found = true;
       minX = Math.min(minX, nb.x);
@@ -477,236 +654,306 @@ const lowConfMenuRef = useRef<HTMLDivElement | null>(null);
     maxX = Math.min(1, Math.max(0, maxX));
     maxY = Math.min(1, Math.max(0, maxY));
 
-    const box = { x: minX, y: minY, w: Math.max(0, maxX - minX), h: Math.max(0, maxY - minY) };
+    const box = {
+      x: minX,
+      y: minY,
+      w: Math.max(0, maxX - minX),
+      h: Math.max(0, maxY - minY),
+    };
     if (box.w <= 0 || box.h <= 0) return null;
     return box;
   }
 
-const lowConfItems = useMemo(() => {
-  if (!doc)
-    return [] as Array<{
+  function boxToBboxn(box: {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  }): [number, number, number, number] {
+    const x1 = Math.min(1, Math.max(0, box.x));
+    const y1 = Math.min(1, Math.max(0, box.y));
+    const x2 = Math.min(1, Math.max(0, box.x + box.w));
+    const y2 = Math.min(1, Math.max(0, box.y + box.h));
+    return [x1, y1, x2, y2];
+  }
+
+  function bboxFromBox(
+    box: { x: number; y: number; w: number; h: number },
+    pageW: number,
+    pageH: number,
+  ): [number, number, number, number] {
+    const x1 = Math.round(Math.min(1, Math.max(0, box.x)) * pageW);
+    const y1 = Math.round(Math.min(1, Math.max(0, box.y)) * pageH);
+    const x2 = Math.round(Math.min(1, Math.max(0, box.x + box.w)) * pageW);
+    const y2 = Math.round(Math.min(1, Math.max(0, box.y + box.h)) * pageH);
+    return [x1, y1, x2, y2];
+  }
+
+  const lowConfItems = useMemo(() => {
+    if (!doc)
+      return [] as Array<{
+        pageKey: string;
+        pageNum: number | null;
+        label: string;
+        confPct: number;
+        targetPid: string;
+        box: { x: number; y: number; w: number; h: number } | null;
+      }>;
+
+    const TH = 0.5; // 50%
+
+    const out: Array<{
       pageKey: string;
       pageNum: number | null;
       label: string;
       confPct: number;
       targetPid: string;
       box: { x: number; y: number; w: number; h: number } | null;
-    }>;
+    }> = [];
 
-  const TH = 0.5; // 50%
+    for (const pk of Object.keys(doc)) {
+      const pageObj: any = (doc as any)[pk];
+      if (!pageObj) continue;
 
-  const out: Array<{
-    pageKey: string;
-    pageNum: number | null;
-    label: string;
-    confPct: number;
-    targetPid: string;
-    box: { x: number; y: number; w: number; h: number } | null;
-  }> = [];
+      const pageNum = pageKeyToNumber(pk);
+      const pageW = Number(pageObj.width);
+      const pageH = Number(pageObj.height);
 
-  for (const pk of Object.keys(doc)) {
-    const pageObj: any = (doc as any)[pk];
-    if (!pageObj) continue;
+      // -----------------
+      // PARAGRAPH blocks (class === "prgph")
+      // NOTE: we IGNORE line-level classes entirely.
+      // -----------------
+      const pars: any[] = Array.isArray(pageObj.paragraphs)
+        ? pageObj.paragraphs
+        : [];
+      for (let pIdx = 0; pIdx < pars.length; pIdx++) {
+        const par: any = pars[pIdx];
+        const cls = String(par?.class ?? "");
+        if (cls !== "prgph") continue;
 
-    const pageNum = pageKeyToNumber(pk);
-    const pageW = Number(pageObj.width);
-    const pageH = Number(pageObj.height);
+        const c = Number(par?.confidence);
+        if (!Number.isFinite(c) || c >= TH) continue;
 
-    // -----------------
-    // PARAGRAPH blocks (class === "prgph")
-    // NOTE: we IGNORE line-level classes entirely.
-    // -----------------
-    const pars: any[] = Array.isArray(pageObj.paragraphs) ? pageObj.paragraphs : [];
-    for (let pIdx = 0; pIdx < pars.length; pIdx++) {
-      const par: any = pars[pIdx];
-      const cls = String(par?.class ?? "");
-      if (cls !== "prgph") continue;
+        const pid = `p-${pIdx}`;
 
-      const c = Number(par?.confidence);
-      if (!Number.isFinite(c) || c >= TH) continue;
+        // Prefer paragraph bbox if present; otherwise derive from lines (bbox union)
+        let nb: {
+          x: number;
+          y: number;
+          w: number;
+          h: number;
+          area: number;
+        } | null = null;
 
-      const pid = `p-${pIdx}`;
+        if (Array.isArray(par?.bbox) && par.bbox.length === 4) {
+          nb = normBoxFromPixels(
+            par.bbox as [number, number, number, number],
+            pageW,
+            pageH,
+          );
+        } else {
+          const linesInPar: any[] = Array.isArray(par?.lines) ? par.lines : [];
+          let minX = 1,
+            minY = 1,
+            maxX = 0,
+            maxY = 0;
+          let found = false;
 
-      // Prefer paragraph bbox if present; otherwise derive from lines (bbox union)
-      let nb:
-        | { x: number; y: number; w: number; h: number; area: number }
-        | null = null;
+          for (const ln of linesInPar) {
+            const bb = Array.isArray(ln?.bbox)
+              ? (ln.bbox as [number, number, number, number])
+              : null;
+            if (!bb) continue;
+            const t = normBoxFromPixels(bb, pageW, pageH);
+            if (!t) continue;
+            found = true;
+            minX = Math.min(minX, t.x);
+            minY = Math.min(minY, t.y);
+            maxX = Math.max(maxX, t.x + t.w);
+            maxY = Math.max(maxY, t.y + t.h);
+          }
 
-      if (Array.isArray(par?.bbox) && par.bbox.length === 4) {
-        nb = normBoxFromPixels(par.bbox as [number, number, number, number], pageW, pageH);
-      } else {
-        const linesInPar: any[] = Array.isArray(par?.lines) ? par.lines : [];
-        let minX = 1,
-          minY = 1,
-          maxX = 0,
-          maxY = 0;
-        let found = false;
-
-        for (const ln of linesInPar) {
-          const bb = Array.isArray(ln?.bbox) ? (ln.bbox as [number, number, number, number]) : null;
-          if (!bb) continue;
-          const t = normBoxFromPixels(bb, pageW, pageH);
-          if (!t) continue;
-          found = true;
-          minX = Math.min(minX, t.x);
-          minY = Math.min(minY, t.y);
-          maxX = Math.max(maxX, t.x + t.w);
-          maxY = Math.max(maxY, t.y + t.h);
+          if (found) {
+            const w = Math.max(0, maxX - minX);
+            const h = Math.max(0, maxY - minY);
+            if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
+          }
         }
 
-        if (found) {
-          const w = Math.max(0, maxX - minX);
-          const h = Math.max(0, maxY - minY);
-          if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
-        }
+        out.push({
+          pageKey: pk,
+          pageNum,
+          label: "Paragraph",
+          confPct: c * 100,
+          targetPid: pid,
+          box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+        });
       }
 
-      out.push({
-        pageKey: pk,
-        pageNum,
-        label: "Paragraph",
-        confPct: c * 100,
-        targetPid: pid,
-        box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
-      });
-    }
+      // -----------------
+      // LIST blocks (class === "list")
+      // -----------------
+      const lists: any[] = Array.isArray(pageObj.lists) ? pageObj.lists : [];
+      for (let listIdx = 0; listIdx < lists.length; listIdx++) {
+        const lst: any = lists[listIdx];
+        const cls = String(lst?.class ?? "");
+        if (cls !== "list") continue;
 
-    // -----------------
-    // LIST blocks (class === "list")
-    // -----------------
-    const lists: any[] = Array.isArray(pageObj.lists) ? pageObj.lists : [];
-    for (let listIdx = 0; listIdx < lists.length; listIdx++) {
-      const lst: any = lists[listIdx];
-      const cls = String(lst?.class ?? "");
-      if (cls !== "list") continue;
+        const c = Number(lst?.confidence);
+        if (!Number.isFinite(c) || c >= TH) continue;
 
-      const c = Number(lst?.confidence);
-      if (!Number.isFinite(c) || c >= TH) continue;
+        const pid = `list-${listIdx}`;
 
-      const pid = `list-${listIdx}`;
+        let nb: {
+          x: number;
+          y: number;
+          w: number;
+          h: number;
+          area: number;
+        } | null = null;
 
-      let nb:
-        | { x: number; y: number; w: number; h: number; area: number }
-        | null = null;
+        if (Array.isArray(lst?.bbox) && lst.bbox.length === 4) {
+          nb = normBoxFromPixels(
+            lst.bbox as [number, number, number, number],
+            pageW,
+            pageH,
+          );
+        } else {
+          const linesInList: any[] = Array.isArray(lst?.lines) ? lst.lines : [];
+          let minX = 1,
+            minY = 1,
+            maxX = 0,
+            maxY = 0;
+          let found = false;
 
-      if (Array.isArray(lst?.bbox) && lst.bbox.length === 4) {
-        nb = normBoxFromPixels(lst.bbox as [number, number, number, number], pageW, pageH);
-      } else {
-        const linesInList: any[] = Array.isArray(lst?.lines) ? lst.lines : [];
-        let minX = 1,
-          minY = 1,
-          maxX = 0,
-          maxY = 0;
-        let found = false;
+          for (const ln of linesInList) {
+            const bb = Array.isArray(ln?.bbox)
+              ? (ln.bbox as [number, number, number, number])
+              : null;
+            if (!bb) continue;
+            const t = normBoxFromPixels(bb, pageW, pageH);
+            if (!t) continue;
+            found = true;
+            minX = Math.min(minX, t.x);
+            minY = Math.min(minY, t.y);
+            maxX = Math.max(maxX, t.x + t.w);
+            maxY = Math.max(maxY, t.y + t.h);
+          }
 
-        for (const ln of linesInList) {
-          const bb = Array.isArray(ln?.bbox) ? (ln.bbox as [number, number, number, number]) : null;
-          if (!bb) continue;
-          const t = normBoxFromPixels(bb, pageW, pageH);
-          if (!t) continue;
-          found = true;
-          minX = Math.min(minX, t.x);
-          minY = Math.min(minY, t.y);
-          maxX = Math.max(maxX, t.x + t.w);
-          maxY = Math.max(maxY, t.y + t.h);
+          if (found) {
+            const w = Math.max(0, maxX - minX);
+            const h = Math.max(0, maxY - minY);
+            if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
+          }
         }
 
-        if (found) {
-          const w = Math.max(0, maxX - minX);
-          const h = Math.max(0, maxY - minY);
-          if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
-        }
+        out.push({
+          pageKey: pk,
+          pageNum,
+          label: "List",
+          confPct: c * 100,
+          targetPid: pid,
+          box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+        });
       }
 
-      out.push({
-        pageKey: pk,
-        pageNum,
-        label: "List",
-        confPct: c * 100,
-        targetPid: pid,
-        box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
-      });
-    }
+      // -----------------
+      // TABLE blocks (class === "table")
+      // -----------------
+      const tables: any[] = Array.isArray(pageObj.tables) ? pageObj.tables : [];
+      for (let tIdx = 0; tIdx < tables.length; tIdx++) {
+        const tbl: any = tables[tIdx];
+        const cls = String(tbl?.class ?? "");
+        if (cls !== "table") continue;
 
-    // -----------------
-    // TABLE blocks (class === "table")
-    // -----------------
-    const tables: any[] = Array.isArray(pageObj.tables) ? pageObj.tables : [];
-    for (let tIdx = 0; tIdx < tables.length; tIdx++) {
-      const tbl: any = tables[tIdx];
-      const cls = String(tbl?.class ?? "");
-      if (cls !== "table") continue;
+        const c = Number(tbl?.confidence);
+        if (!Number.isFinite(c) || c >= TH) continue;
 
-      const c = Number(tbl?.confidence);
-      if (!Number.isFinite(c) || c >= TH) continue;
+        const pid = `table-${tIdx}`;
 
-      const pid = `table-${tIdx}`;
+        let nb: {
+          x: number;
+          y: number;
+          w: number;
+          h: number;
+          area: number;
+        } | null = null;
 
-      let nb:
-        | { x: number; y: number; w: number; h: number; area: number }
-        | null = null;
+        if (Array.isArray(tbl?.bbox) && tbl.bbox.length === 4) {
+          nb = normBoxFromPixels(
+            tbl.bbox as [number, number, number, number],
+            pageW,
+            pageH,
+          );
+        } else {
+          const linesInTable: any[] = Array.isArray(tbl?.lines)
+            ? tbl.lines
+            : [];
+          let minX = 1,
+            minY = 1,
+            maxX = 0,
+            maxY = 0;
+          let found = false;
 
-      if (Array.isArray(tbl?.bbox) && tbl.bbox.length === 4) {
-        nb = normBoxFromPixels(tbl.bbox as [number, number, number, number], pageW, pageH);
-      } else {
-        const linesInTable: any[] = Array.isArray(tbl?.lines) ? tbl.lines : [];
-        let minX = 1,
-          minY = 1,
-          maxX = 0,
-          maxY = 0;
-        let found = false;
+          for (const ln of linesInTable) {
+            const bb = Array.isArray(ln?.bbox)
+              ? (ln.bbox as [number, number, number, number])
+              : null;
+            if (!bb) continue;
+            const t = normBoxFromPixels(bb, pageW, pageH);
+            if (!t) continue;
+            found = true;
+            minX = Math.min(minX, t.x);
+            minY = Math.min(minY, t.y);
+            maxX = Math.max(maxX, t.x + t.w);
+            maxY = Math.max(maxY, t.y + t.h);
+          }
 
-        for (const ln of linesInTable) {
-          const bb = Array.isArray(ln?.bbox) ? (ln.bbox as [number, number, number, number]) : null;
-          if (!bb) continue;
-          const t = normBoxFromPixels(bb, pageW, pageH);
-          if (!t) continue;
-          found = true;
-          minX = Math.min(minX, t.x);
-          minY = Math.min(minY, t.y);
-          maxX = Math.max(maxX, t.x + t.w);
-          maxY = Math.max(maxY, t.y + t.h);
+          if (found) {
+            const w = Math.max(0, maxX - minX);
+            const h = Math.max(0, maxY - minY);
+            if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
+          }
         }
 
-        if (found) {
-          const w = Math.max(0, maxX - minX);
-          const h = Math.max(0, maxY - minY);
-          if (w > 0 && h > 0) nb = { x: minX, y: minY, w, h, area: w * h };
-        }
+        out.push({
+          pageKey: pk,
+          pageNum,
+          label: "Table",
+          confPct: c * 100,
+          targetPid: pid,
+          box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+        });
       }
-
-      out.push({
-        pageKey: pk,
-        pageNum,
-        label: "Table",
-        confPct: c * 100,
-        targetPid: pid,
-        box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
-      });
     }
-  }
 
-  // Sort: page asc, then Paragraph/List/Table, then lowest confidence first
-  out.sort((a, b) => {
-    const ap = a.pageNum ?? 1e9;
-    const bp = b.pageNum ?? 1e9;
-    if (ap !== bp) return ap - bp;
+    // Sort: page asc, then Paragraph/List/Table, then lowest confidence first
+    out.sort((a, b) => {
+      const ap = a.pageNum ?? 1e9;
+      const bp = b.pageNum ?? 1e9;
+      if (ap !== bp) return ap - bp;
 
-    const order = (lbl: string) => (lbl === "Paragraph" ? 0 : lbl === "List" ? 1 : 2);
-    const ao = order(a.label);
-    const bo = order(b.label);
-    if (ao !== bo) return ao - bo;
+      const order = (lbl: string) =>
+        lbl === "Paragraph" ? 0 : lbl === "List" ? 1 : 2;
+      const ao = order(a.label);
+      const bo = order(b.label);
+      if (ao !== bo) return ao - bo;
 
-    return a.confPct - b.confPct;
-  });
+      return a.confPct - b.confPct;
+    });
 
-  return out;
-}, [doc]);
+    return out;
+  }, [doc]);
 
   const lowConfByPid = useMemo(() => {
     const by: Record<
       string,
-      { label: string; confPct: number; predicted_class: string; predicted_confidence: number }
+      {
+        label: string;
+        confPct: number;
+        predicted_class: string;
+        predicted_confidence: number;
+      }
     > = {};
 
     for (const it of lowConfItems) {
@@ -724,7 +971,11 @@ const lowConfItems = useMemo(() => {
 
   useEffect(() => {
     // These stats are shown on the welcome page as soon as we have the JSON/PDF.
-    const pages = pdf?.numPages ?? (doc ? Object.keys(doc).filter((k) => pageKeyToNumber(k) != null).length : null);
+    const pages =
+      pdf?.numPages ??
+      (doc
+        ? Object.keys(doc).filter((k) => pageKeyToNumber(k) != null).length
+        : null);
 
     let lines: number | null = null;
     if (doc) {
@@ -752,6 +1003,573 @@ const lowConfItems = useMemo(() => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pageKeys]);
 
+  async function loadMapDocOptions(): Promise<MapDocOption[]> {
+    if (!supabase) return [];
+    setIsLoadingMap(true);
+    setMapError(null);
+
+    try {
+      const { data, error } = await supabase
+        .from("documents")
+        .select("id,title")
+        .limit(5000);
+
+      if (error) throw error;
+
+      const docs: MapDocOption[] = (data ?? [])
+        .map((r: any) => ({
+          id: String(r?.id ?? ""),
+          title: String(r?.title ?? "").trim() || "(Untitled)",
+        }))
+        .filter((d) => d.id);
+
+      setMapDocOptions(docs);
+
+      if (docs.length) {
+        setSelectedMapDocId((cur) => {
+          // Preserve the special ALL selection if already chosen.
+          if (cur === "__ALL__") return cur;
+
+          // Keep current selection if it still exists; otherwise default to ALL.
+          if (cur && docs.some((d) => d.id === cur)) return cur;
+
+          return "__ALL__";
+        });
+      } else {
+        // Still allow selecting ALL even if there are no documents returned.
+        setSelectedMapDocId("__ALL__");
+      }
+      return docs;
+    } catch (e: any) {
+      console.warn("map docs load failed", e);
+      setMapError(e?.message || String(e));
+      setMapDocOptions([]);
+      setSelectedMapDocId("");
+      return [];
+    } finally {
+      setIsLoadingMap(false);
+    }
+  }
+
+  async function loadLocationsForDoc(docId: string): Promise<DocLocation[]> {
+    if (!supabase) return [];
+    if (!docId) {
+      setMapLocations([]);
+      return [];
+    }
+
+    setIsLoadingMap(true);
+    setMapError(null);
+
+    try {
+      const { data, error } = await supabase
+        .from("document_locations")
+        .select("id,document_id,seq,label,lat,lng,note")
+        .eq("document_id", docId)
+        .order("seq", { ascending: true })
+        .limit(2000);
+
+      if (error) throw error;
+
+      const locs: DocLocation[] = (data ?? [])
+        .map((r: any) => ({
+          id: String(r?.id ?? ""),
+          document_id: String(r?.document_id ?? ""),
+          seq: Number(r?.seq ?? 0),
+          label: r?.label == null ? null : String(r.label),
+          lat: Number(r?.lat),
+          lng: Number(r?.lng),
+          note: r?.note == null ? null : String(r.note),
+        }))
+        .filter(
+          (d) =>
+            d.id &&
+            d.document_id &&
+            Number.isFinite(d.lat) &&
+            Number.isFinite(d.lng),
+        );
+
+      setMapLocations(locs);
+      return locs;
+    } catch (e: any) {
+      console.warn("map locations load failed", e);
+      setMapError(e?.message || String(e));
+      setMapLocations([]);
+      return [];
+    } finally {
+      setIsLoadingMap(false);
+    }
+  }
+
+  async function loadLocationsForViewer(docId: string): Promise<DocLocation[]> {
+    if (!supabase) return [];
+    if (!docId) {
+      setViewerLocations([]);
+      return [];
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from("document_locations")
+        .select("id,document_id,seq,label,lat,lng,note")
+        .eq("document_id", docId)
+        .order("seq", { ascending: true })
+        .limit(2000);
+
+      if (error) throw error;
+
+      const locs: DocLocation[] = (data ?? [])
+        .map((r: any) => ({
+          id: String(r?.id ?? ""),
+          document_id: String(r?.document_id ?? ""),
+          seq: Number(r?.seq ?? 0),
+          label: r?.label == null ? null : String(r.label),
+          lat: Number(r?.lat),
+          lng: Number(r?.lng),
+          note: r?.note == null ? null : String(r.note),
+        }))
+        .filter(
+          (d) =>
+            d.id &&
+            d.document_id &&
+            Number.isFinite(d.lat) &&
+            Number.isFinite(d.lng),
+        );
+
+      setViewerLocations(locs);
+      return locs;
+    } catch (e) {
+      console.warn("viewer locations load failed", e);
+      setViewerLocations([]);
+      return [];
+    }
+  }
+
+  async function loadAggregatedLocationsAllDocs(): Promise<
+    AggregatedLocation[]
+  > {
+    if (!supabase) return [];
+
+    setIsLoadingMap(true);
+    setMapError(null);
+
+    try {
+      const { data, error } = await supabase
+        .from("document_locations")
+        .select("document_id,lat,lng")
+        .limit(20000);
+
+      if (error) throw error;
+
+      const rows = (data ?? []) as any[];
+
+      // group by rounded lat/lng to avoid float-key mismatch
+      const keyOf = (lat: number, lng: number) =>
+        `${lat.toFixed(5)},${lng.toFixed(5)}`;
+
+      const groups: Record<
+        string,
+        { lat: number; lng: number; docIds: Set<string> }
+      > = {};
+
+      for (const r of rows) {
+        const docId = String(r?.document_id ?? "");
+        const lat = Number(r?.lat);
+        const lng = Number(r?.lng);
+        if (!docId || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+        const k = keyOf(lat, lng);
+        if (!groups[k]) groups[k] = { lat, lng, docIds: new Set<string>() };
+        groups[k].docIds.add(docId);
+      }
+
+      const allDocIds = Array.from(
+        new Set(Object.values(groups).flatMap((g) => Array.from(g.docIds))),
+      );
+
+      const titleById: Record<string, string> = {};
+      if (allDocIds.length) {
+        const { data: docs, error: dErr } = await supabase
+          .from("documents")
+          .select("id,title")
+          .in("id", allDocIds);
+
+        if (!dErr && docs) {
+          for (const d of docs as any[]) {
+            const id = String(d?.id ?? "");
+            const title = String(d?.title ?? "").trim();
+            if (id) titleById[id] = title || "(Untitled)";
+          }
+        }
+      }
+
+      const out: AggregatedLocation[] = Object.entries(groups).map(([k, g]) => {
+        const ids = Array.from(g.docIds);
+        const titles = ids
+          .map((id) => titleById[id] || id)
+          .sort((a, b) => a.localeCompare(b));
+        return {
+          key: k,
+          lat: g.lat,
+          lng: g.lng,
+          doc_count: ids.length,
+          doc_ids: ids,
+          doc_titles: titles,
+        };
+      });
+
+      out.sort((a, b) => b.doc_count - a.doc_count);
+
+      setMapAggLocations(out);
+      return out;
+    } catch (e: any) {
+      console.warn("map aggregated locations load failed", e);
+      setMapError(e?.message || String(e));
+      setMapAggLocations([]);
+      return [];
+    } finally {
+      setIsLoadingMap(false);
+    }
+  }
+
+  function openLocationModalForCurrentPage() {
+    if (!doc || !pageKey || !doc[pageKey]) {
+      alert("This page has no transcription, so locations can’t be added.");
+      return;
+    }
+    // Require auth for editing/adding locations
+    if (!user) {
+      setShowSignin(true);
+      return;
+    }
+
+    const seq = pageKeyToNumber(pageKey);
+    if (seq == null) {
+      alert("Could not determine page number for this page.");
+      return;
+    }
+    const existing = viewerLocations.find((l) => l.seq === seq) ?? null;
+
+    setLocLabel(existing?.label ?? "");
+    setLocLat(
+      existing && Number.isFinite(existing.lat) ? String(existing.lat) : "",
+    );
+    setLocLng(
+      existing && Number.isFinite(existing.lng) ? String(existing.lng) : "",
+    );
+    setLocNote(existing?.note ?? "");
+
+    setShowAddLocation(true);
+  }
+
+  async function saveLocationForCurrentPage() {
+    if (!doc || !pageKey || !doc[pageKey]) {
+      return alert(
+        "This page has no transcription, so locations can’t be saved.",
+      );
+    }
+    if (!supabase)
+      return alert("Missing Supabase env vars on this deployment.");
+    if (!DOCUMENT_ID)
+      return alert("Missing NEXT_PUBLIC_DOCUMENT_ID in .env.local");
+    if (!user) return alert("Please sign in to add locations.");
+
+    const seq = pageKeyToNumber(pageKey);
+    if (seq == null)
+      return alert("Could not determine page number for this page.");
+
+    const lat = Number(locLat);
+    const lng = Number(locLng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return alert("Please enter valid latitude and longitude.");
+    }
+
+    const label = locLabel.trim() || null;
+    const note = locNote.trim() || null;
+
+    setIsSavingLocation(true);
+    try {
+      let row: any = null;
+
+      // Preferred: upsert by (document_id, seq) IF a unique constraint exists.
+      const up = await supabase
+        .from("document_locations")
+        .upsert(
+          { document_id: DOCUMENT_ID, seq, label, lat, lng, note },
+          { onConflict: "document_id,seq" },
+        )
+        .select("id,document_id,seq,label,lat,lng,note")
+        .maybeSingle();
+
+      if (!up.error) {
+        row = up.data;
+      } else {
+        // If no unique constraint / onConflict not allowed, fall back to insert.
+        const msg = String(up.error.message || up.error);
+        const looksLikeNoConstraint =
+          /on\s*conflict/i.test(msg) ||
+          /there is no unique|no unique constraint|no unique or exclusion constraint|constraint/i.test(
+            msg,
+          );
+
+        if (!looksLikeNoConstraint) throw up.error;
+
+        const ins = await supabase
+          .from("document_locations")
+          .insert({ document_id: DOCUMENT_ID, seq, label, lat, lng, note })
+          .select("id,document_id,seq,label,lat,lng,note")
+          .maybeSingle();
+
+        if (!ins.error) {
+          row = ins.data;
+        } else {
+          // If duplicate exists but we couldn't upsert, do an update.
+          const msg2 = String(ins.error.message || ins.error);
+          const looksDuplicate = /duplicate|already exists|unique/i.test(msg2);
+          if (!looksDuplicate) throw ins.error;
+
+          const upd = await supabase
+            .from("document_locations")
+            .update({ label, lat, lng, note })
+            .eq("document_id", DOCUMENT_ID)
+            .eq("seq", seq)
+            .select("id,document_id,seq,label,lat,lng,note")
+            .maybeSingle();
+
+          if (upd.error) throw upd.error;
+          row = upd.data;
+        }
+      }
+
+      // Close modal + clear inputs
+      setShowAddLocation(false);
+      setLocLabel("");
+      setLocLat("");
+      setLocLng("");
+      setLocNote("");
+
+      // Update local state list
+      if (row) {
+        setMapLocations((prev) => {
+          const next = prev.filter(
+            (x) => !(x.document_id === row.document_id && x.seq === row.seq),
+          );
+          next.push({
+            id: String((row as any).id ?? ""),
+            document_id: String((row as any).document_id ?? ""),
+            seq: Number((row as any).seq ?? seq),
+            label:
+              (row as any).label == null ? null : String((row as any).label),
+            lat: Number((row as any).lat),
+            lng: Number((row as any).lng),
+            note: (row as any).note == null ? null : String((row as any).note),
+          });
+          next.sort((a, b) => a.seq - b.seq);
+          return next;
+        });
+        setViewerLocations((prev) => {
+          const next = prev.filter(
+            (x) => !(x.document_id === row.document_id && x.seq === row.seq),
+          );
+          next.push({
+            id: String((row as any).id ?? ""),
+            document_id: String((row as any).document_id ?? ""),
+            seq: Number((row as any).seq ?? seq),
+            label:
+              (row as any).label == null ? null : String((row as any).label),
+            lat: Number((row as any).lat),
+            lng: Number((row as any).lng),
+            note: (row as any).note == null ? null : String((row as any).note),
+          });
+          next.sort((a, b) => a.seq - b.seq);
+          return next;
+        });
+      }
+
+      if (viewMode === "map") {
+        const docId = selectedMapDocId || DOCUMENT_ID;
+
+        if (docId === "__ALL__") {
+          const aggs = await loadAggregatedLocationsAllDocs();
+          renderMapAggregates(aggs);
+        } else {
+          const locs = await loadLocationsForDoc(docId);
+          renderMapTrail(locs);
+        }
+      }
+
+      alert(`Saved location for page ${seq}.`);
+    } catch (e: any) {
+      console.warn("save location failed", e);
+      alert(e?.message || String(e));
+    } finally {
+      setIsSavingLocation(false);
+    }
+  }
+
+  function renderMapAggregates(locs: AggregatedLocation[]) {
+    const L = (window as any).L;
+    const map = leafletMapRef.current;
+    if (!L || !map) return;
+
+    // clear markers
+    if (leafletLayerRef.current) {
+      try {
+        leafletLayerRef.current.clearLayers();
+      } catch {}
+    } else {
+      leafletLayerRef.current = L.layerGroup().addTo(map);
+    }
+
+    // no polyline for aggregates
+    if (leafletPolylineRef.current) {
+      try {
+        leafletPolylineRef.current.remove();
+      } catch {}
+      leafletPolylineRef.current = null;
+    }
+
+    const pts: any[] = [];
+
+    for (const d of locs) {
+      const lat = Number(d.lat);
+      const lng = Number(d.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+      pts.push([lat, lng]);
+
+      const count = Math.max(1, Number(d.doc_count || 0));
+
+      const tooltipHtml = `<div style="font-weight:900;">${count} file${count === 1 ? "" : "s"}</div>`;
+
+      const listHtml = (d.doc_titles || [])
+        .slice(0, 15)
+        .map((t) => String(t).replace(/</g, "&lt;"))
+        .join("<br/>");
+
+      const more =
+        (d.doc_titles || []).length > 15
+          ? `<br/><div style="opacity:0.75;">+${(d.doc_titles || []).length - 15} more</div>`
+          : "";
+
+      const popupHtml = `<b>${count} file${count === 1 ? "" : "s"} at this location</b>${
+        listHtml ? `<div style="margin-top:6px;">${listHtml}${more}</div>` : ""
+      }`;
+
+      const icon = L.divIcon({
+        className: "",
+        html: `<div style="width:30px;height:30px;border-radius:999px;background:#111;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.25);border:2px solid rgba(255,255,255,0.9);">${count}</div>`,
+        iconSize: [30, 30],
+        iconAnchor: [15, 15],
+      });
+
+      const m = L.marker([lat, lng], { icon });
+      m.bindTooltip(tooltipHtml, {
+        direction: "top",
+        offset: [0, -14],
+        opacity: 0.95,
+        sticky: true,
+      });
+      m.bindPopup(popupHtml);
+      m.addTo(leafletLayerRef.current);
+    }
+
+    if (pts.length) {
+      const b = L.latLngBounds(pts);
+      map.fitBounds(b, { padding: [30, 30] });
+    } else {
+      map.setView([20, 0], 2);
+    }
+
+    try {
+      map.invalidateSize?.();
+    } catch {}
+  }
+
+  function renderMapTrail(locs: DocLocation[]) {
+    const L = (window as any).L;
+    const map = leafletMapRef.current;
+    if (!L || !map) return;
+
+    // clear markers
+    if (leafletLayerRef.current) {
+      try {
+        leafletLayerRef.current.clearLayers();
+      } catch {}
+    } else {
+      leafletLayerRef.current = L.layerGroup().addTo(map);
+    }
+
+    // clear existing polyline
+    if (leafletPolylineRef.current) {
+      try {
+        leafletPolylineRef.current.remove();
+      } catch {}
+      leafletPolylineRef.current = null;
+    }
+
+    // add markers + polyline
+    const pts: any[] = [];
+
+    let displayIdx = 0;
+
+    for (const d of locs) {
+      const lat = Number(d.lat);
+      const lng = Number(d.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+      // Marker number should be the sequence within this document (1..N), NOT the page number.
+      displayIdx += 1;
+      const markerNo = displayIdx;
+
+      pts.push([lat, lng]);
+
+      const title = (d.label || "Location").replace(/</g, "&lt;");
+      const note = (d.note || "").replace(/</g, "&lt;");
+
+      // Hover tooltip should show: Page: <pageNumber> and the label
+      const tooltipHtml = `<div style="font-weight:900;">Page: ${d.seq} • ${title}</div>`;
+
+      // Popup can include marker number + page + label (+ optional note)
+      const popupHtml = `<b>#${markerNo} • Page ${d.seq}: ${title}</b>${note ? `<br/>${note}` : ""}`;
+
+      const icon = L.divIcon({
+        className: "",
+        html: `<div style="width:28px;height:28px;border-radius:999px;background:#111;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.25);border:2px solid rgba(255,255,255,0.9);">${markerNo}</div>`,
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+      });
+
+      const m = L.marker([lat, lng], { icon });
+      m.bindPopup(popupHtml);
+      m.bindTooltip(tooltipHtml, {
+        direction: "top",
+        offset: [0, -14],
+        opacity: 0.95,
+        sticky: true,
+      });
+      m.addTo(leafletLayerRef.current);
+    }
+
+    if (pts.length >= 2) {
+      leafletPolylineRef.current = L.polyline(pts, {
+        weight: 3,
+        opacity: 0.85,
+      }).addTo(map);
+    }
+
+    if (pts.length) {
+      const b = L.latLngBounds(pts);
+      map.fitBounds(b, { padding: [30, 30] });
+    } else {
+      map.setView([20, 0], 2);
+    }
+
+    try {
+      map.invalidateSize?.();
+    } catch {}
+  }
+
   async function loadSuggestionsForPage(docId: string, pk: string) {
     if (!supabase) return;
     if (!docId || !pk) return;
@@ -759,7 +1577,9 @@ const lowConfItems = useMemo(() => {
     try {
       const { data, error } = await supabase
         .from("suggestions")
-        .select("id,document_id,page_key,uid,suggested_text,comment,user_id,created_at,author_username,suggestion_votes(count)")
+        .select(
+          "id,document_id,page_key,uid,suggested_text,comment,user_id,created_at,author_username,suggestion_votes(count)",
+        )
         .eq("document_id", docId)
         .eq("page_key", pk);
 
@@ -798,7 +1618,9 @@ const lowConfItems = useMemo(() => {
           const va = a.vote_count ?? 0;
           const vb = b.vote_count ?? 0;
           if (vb !== va) return vb - va;
-          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+          return (
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+          );
         });
       }
 
@@ -809,12 +1631,14 @@ const lowConfItems = useMemo(() => {
         new Set(
           (data ?? [])
             .map((r: any) => String(r.user_id || ""))
-            .filter((x: string) => x.length > 0)
-        )
+            .filter((x: string) => x.length > 0),
+        ),
       );
 
       // Treat "missing" as: we don't have a non-empty username cached yet
-      const missing = userIds.filter((id) => !(usernameByUserId[id]?.trim()?.length));
+      const missing = userIds.filter(
+        (id) => !usernameByUserId[id]?.trim()?.length,
+      );
 
       if (missing.length) {
         const { data: profs, error: pErr } = await supabase
@@ -837,7 +1661,6 @@ const lowConfItems = useMemo(() => {
           console.warn("profiles select failed", pErr);
         }
       }
-
     } catch (e) {
       console.warn(e);
       setSuggestionsByUid({});
@@ -848,8 +1671,10 @@ const lowConfItems = useMemo(() => {
 
   async function submitSuggestion(uid: string, originalText: string) {
     if (!user) return alert("Please sign in to suggest edits.");
-    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
-    if (!DOCUMENT_ID) return alert("Missing NEXT_PUBLIC_DOCUMENT_ID in .env.local");
+    if (!supabase)
+      return alert("Missing Supabase env vars on this deployment.");
+    if (!DOCUMENT_ID)
+      return alert("Missing NEXT_PUBLIC_DOCUMENT_ID in .env.local");
     if (!pageKey) return;
 
     const normalizeText = (s: string) => s.replace(/\s+/g, " ").trim();
@@ -858,7 +1683,10 @@ const lowConfItems = useMemo(() => {
     if (!text) return;
 
     const original = normalizeText(originalText || "");
-    if (text === original) return alert("Your suggestion is identical to the current transcription.");
+    if (text === original)
+      return alert(
+        "Your suggestion is identical to the current transcription.",
+      );
 
     const unameSnapshot =
       (usernameByUserId[user.id] && usernameByUserId[user.id].trim()) ||
@@ -885,67 +1713,101 @@ const lowConfItems = useMemo(() => {
     await loadSuggestionsForPage(DOCUMENT_ID, pageKey);
   }
 
-useEffect(() => {
-  if (!supabase) return;
-  if (!DOCUMENT_ID) return;
+  useEffect(() => {
+    if (!supabase) return;
+    if (!DOCUMENT_ID) return;
 
-  let cancelled = false;
+    let cancelled = false;
 
-  (async () => {
-    try {
-      const { data, error } = await supabase
-        .from("low_conf_labels")
-        .select(
-          "id,document_id,page_key,target_pid,predicted_class,predicted_confidence,corrected_class,other_text,user_id,author_username,updated_at"
-        )
-        .eq("document_id", DOCUMENT_ID)
-        .limit(10000);
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from("low_conf_labels")
+          .select("*")
+          .eq("document_id", DOCUMENT_ID)
+          .limit(10000);
 
-      if (error) throw error;
-      if (cancelled) return;
+        if (error) throw error;
+        if (cancelled) return;
 
-      const next: Record<
-        string,
-        {
-          corrected_class: "Paragraph" | "List" | "Table" | "Other";
-          other_text: string;
-          author_username?: string;
-          user_id?: string;
-          updated_at?: string;
+        const next: Record<
+          string,
+          {
+            corrected_class: "Paragraph" | "List" | "Table" | "Other";
+            other_text: string;
+            author_username?: string;
+            user_id?: string;
+            updated_at?: string;
+          }
+        > = {};
+
+        for (const r of (data ?? []) as any[]) {
+          const pk = String(r?.page_key ?? "");
+          const tp = String(r?.target_pid ?? "");
+          if (!pk || !tp) continue;
+
+          const key = `${pk}|${tp}`;
+          const cls = String(r?.corrected_class ?? "Other") as any;
+
+          next[key] = {
+            corrected_class: cls,
+            other_text: String(r?.other_text ?? ""),
+            author_username: String(r?.author_username ?? "") || undefined,
+            user_id: String(r?.user_id ?? "") || undefined,
+            updated_at: String(r?.updated_at ?? "") || undefined,
+          };
         }
-      > = {};
 
-      for (const r of (data ?? []) as any[]) {
-        const pk = String(r?.page_key ?? "");
-        const tp = String(r?.target_pid ?? "");
-        if (!pk || !tp) continue;
+        setLowConfLabelsByKey(next);
+        // Also hydrate any previously saved corrected bboxn so it shows immediately
+        const drawnNext: Record<
+          string,
+          { x: number; y: number; w: number; h: number }
+        > = {};
 
-        const key = `${pk}|${tp}`;
-        const cls = String(r?.corrected_class ?? "Other") as any;
+        for (const r of (data ?? []) as any[]) {
+          const pk = String(r?.page_key ?? "");
+          const tp = String(r?.target_pid ?? "");
+          if (!pk || !tp) continue;
 
-        next[key] = {
-          corrected_class: cls,
-          other_text: String(r?.other_text ?? ""),
-          author_username: String(r?.author_username ?? "") || undefined,
-          user_id: String(r?.user_id ?? "") || undefined,
-          updated_at: String(r?.updated_at ?? "") || undefined,
-        };
+          const bbN = r?.corrected_bboxn;
+          if (Array.isArray(bbN) && bbN.length === 4) {
+            const x1 = Number(bbN[0]);
+            const y1 = Number(bbN[1]);
+            const x2 = Number(bbN[2]);
+            const y2 = Number(bbN[3]);
+
+            if ([x1, y1, x2, y2].every((v) => Number.isFinite(v))) {
+              const xMin = Math.min(x1, x2);
+              const xMax = Math.max(x1, x2);
+              const yMin = Math.min(y1, y2);
+              const yMax = Math.max(y1, y2);
+              const w = Math.max(0, xMax - xMin);
+              const h = Math.max(0, yMax - yMin);
+
+              if (w > 0 && h > 0) {
+                drawnNext[`${pk}|${tp}`] = {
+                  x: Math.min(1, Math.max(0, xMin)),
+                  y: Math.min(1, Math.max(0, yMin)),
+                  w: Math.min(1, Math.max(0, w)),
+                  h: Math.min(1, Math.max(0, h)),
+                };
+              }
+            }
+          }
+        }
+
+        setLowConfDrawnBoxByKey((prev) => ({ ...prev, ...drawnNext }));
+      } catch (e) {
+        console.warn("low_conf_labels load failed", e);
       }
+    })();
 
-      setLowConfLabelsByKey(next);
-    } catch (e) {
-      console.warn("low_conf_labels load failed", e);
-    }
-  })();
-
-  return () => {
-    cancelled = true;
-  };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [supabase, DOCUMENT_ID]);
-
-
-
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supabase, DOCUMENT_ID]);
 
   async function saveLowConfLabel(args: {
     page_key: string;
@@ -955,8 +1817,10 @@ useEffect(() => {
     corrected_class: "Paragraph" | "List" | "Table" | "Other";
     other_text: string;
   }) {
-    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
-    if (!DOCUMENT_ID) return alert("Missing NEXT_PUBLIC_DOCUMENT_ID in .env.local");
+    if (!supabase)
+      return alert("Missing Supabase env vars on this deployment.");
+    if (!DOCUMENT_ID)
+      return alert("Missing NEXT_PUBLIC_DOCUMENT_ID in .env.local");
     if (!user) return alert("Please sign in to save labels.");
 
     const unameSnapshot =
@@ -964,47 +1828,124 @@ useEffect(() => {
       (user.email ? user.email.split("@")[0] : "") ||
       `user_${user.id.slice(0, 6)}`;
 
-    const payload = {
+    const drawnKey = `${args.page_key}|${args.target_pid}`;
+    const drawn = lowConfDrawnBoxByKey[drawnKey] ?? null;
+
+    // Convert drawn box into bboxn (normalized) and bbox (pixel) if we have page dims.
+    let corrected_bboxn: [number, number, number, number] | null = null;
+    let corrected_bbox: [number, number, number, number] | null = null;
+
+    if (drawn) {
+      corrected_bboxn = boxToBboxn(drawn);
+
+      const pageObj: any = (doc as any)?.[args.page_key];
+      const pageW = Number(pageObj?.width);
+      const pageH = Number(pageObj?.height);
+
+      if (
+        Number.isFinite(pageW) &&
+        Number.isFinite(pageH) &&
+        pageW > 0 &&
+        pageH > 0
+      ) {
+        corrected_bbox = bboxFromBox(drawn, pageW, pageH);
+      }
+    }
+
+    const basePayload: any = {
       document_id: DOCUMENT_ID,
       page_key: args.page_key,
       target_pid: args.target_pid,
       predicted_class: args.predicted_class,
       predicted_confidence: args.predicted_confidence,
       corrected_class: args.corrected_class,
+      // NOTE: if the DB doesn't yet have corrected_bbox / corrected_bboxn columns,
+      // we will fall back to storing the drawn box in other_text (see retry below).
       other_text: args.other_text ? args.other_text.trim() : null,
       user_id: user.id,
       author_username: unameSnapshot,
       updated_at: new Date().toISOString(),
     };
 
-    const { data, error } = await supabase
-      .from("low_conf_labels")
-      .upsert(payload, { onConflict: "document_id,page_key,target_pid" })
-      .select("page_key,target_pid,corrected_class,other_text,user_id,author_username,updated_at")
-      .maybeSingle();
+    // Try to include corrected bbox fields if the table has them.
+    // Some deployments may not have these columns yet; if PostgREST complains,
+    // retry the upsert without the bbox fields.
+    const payloadWithBoxes: any = {
+      ...basePayload,
+      ...(corrected_bboxn ? { corrected_bboxn } : {}),
+      ...(corrected_bbox ? { corrected_bbox } : {}),
+    };
+
+    let data: any = null;
+    let error: any = null;
+
+    // First attempt (with bbox fields if available)
+    {
+      const res = await supabase
+        .from("low_conf_labels")
+        .upsert(payloadWithBoxes, {
+          onConflict: "document_id,page_key,target_pid",
+        })
+        .select("*")
+        .maybeSingle();
+      data = res.data;
+      error = res.error;
+    }
+
+    // If the table doesn't have bbox columns, retry without them.
+    // BUT still persist the drawn box by embedding it into other_text so no work is lost.
+    if (
+      error &&
+      /corrected_bboxn|corrected_bbox/i.test(String(error.message || error))
+    ) {
+      const baseOther = (args.other_text ? args.other_text.trim() : "").trim();
+
+      // Store bbox info in other_text in a parseable way.
+      // (You can migrate it to real columns later without losing data.)
+      const boxNote = corrected_bboxn
+        ? `\n\n__corrected_bboxn__=${JSON.stringify(corrected_bboxn)}\n__corrected_bbox__=${
+            corrected_bbox ? JSON.stringify(corrected_bbox) : "null"
+          }`
+        : "";
+
+      const fallbackOther = (baseOther + boxNote).trim() || null;
+
+      const res2 = await supabase
+        .from("low_conf_labels")
+        .upsert(
+          { ...basePayload, other_text: fallbackOther },
+          { onConflict: "document_id,page_key,target_pid" },
+        )
+        .select("*")
+        .maybeSingle();
+      data = res2.data;
+      error = res2.error;
+    }
 
     if (error) {
       console.warn("low_conf_labels upsert failed", error);
-      return alert(error.message);
+      return alert(error.message || String(error));
     }
 
     const key = `${args.page_key}|${args.target_pid}`;
     setLowConfLabelsByKey((prev) => ({
       ...prev,
       [key]: {
-        corrected_class: (data?.corrected_class ?? args.corrected_class) as any,
+        corrected_class: data?.corrected_class ?? args.corrected_class,
         other_text: String(data?.other_text ?? args.other_text ?? ""),
-        author_username: String(data?.author_username ?? unameSnapshot) || undefined,
+        author_username:
+          String(data?.author_username ?? unameSnapshot) || undefined,
         user_id: String(data?.user_id ?? user.id) || undefined,
-        updated_at: String(data?.updated_at ?? payload.updated_at) || undefined,
+        updated_at:
+          String(data?.updated_at ?? basePayload.updated_at) || undefined,
       },
     }));
   }
 
-
-
-
-  async function ensureProfileUsername(userId: string, fallbackEmail?: string | null) {
+  async function ensureProfileUsername(
+    userId: string,
+    fallbackEmail?: string | null,
+  ) {
     if (!supabase) return;
     const { data, error } = await supabase
       .from("profiles")
@@ -1024,7 +1965,8 @@ useEffect(() => {
 
     // No profile row (or username empty) -> create one using a fallback
     const fallback =
-      (fallbackEmail?.split("@")[0] ?? "").trim() || `user_${userId.slice(0, 6)}`;
+      (fallbackEmail?.split("@")[0] ?? "").trim() ||
+      `user_${userId.slice(0, 6)}`;
 
     const { error: upsertErr } = await supabase
       .from("profiles")
@@ -1040,18 +1982,17 @@ useEffect(() => {
 
   async function upvoteSuggestion(suggestionId: string) {
     if (!user) return alert("Please sign in to vote.");
-    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
+    if (!supabase)
+      return alert("Missing Supabase env vars on this deployment.");
 
-    const { error } = await supabase
-      .from("suggestion_votes")
-      .upsert(
-        {
-          suggestion_id: suggestionId,
-          user_id: user.id,
-          vote: 1,
-        },
-        { onConflict: "suggestion_id,user_id" }
-      );
+    const { error } = await supabase.from("suggestion_votes").upsert(
+      {
+        suggestion_id: suggestionId,
+        user_id: user.id,
+        vote: 1,
+      },
+      { onConflict: "suggestion_id,user_id" },
+    );
 
     if (error) return alert(error.message);
 
@@ -1087,14 +2028,21 @@ useEffect(() => {
       }
 
       let arr = Object.entries(totals)
-        .map(([user_id, v]) => ({ user_id, upvotes: v.upvotes, username: v.username || "" }))
+        .map(([user_id, v]) => ({
+          user_id,
+          upvotes: v.upvotes,
+          username: v.username || "",
+        }))
         .sort((a, b) => b.upvotes - a.upvotes)
         .slice(0, 10);
 
       // Enrich with profiles usernames
       const ids = arr.map((r) => r.user_id);
       if (ids.length) {
-        const { data: profs, error: pErr } = await supabase.from("profiles").select("id, username").in("id", ids);
+        const { data: profs, error: pErr } = await supabase
+          .from("profiles")
+          .select("id, username")
+          .in("id", ids);
         if (!pErr && profs) {
           const byId: Record<string, string> = {};
           for (const p of profs as any[]) {
@@ -1104,12 +2052,16 @@ useEffect(() => {
           }
           arr = arr.map((r) => ({
             ...r,
-            username: byId[r.user_id] || r.username || `user:${r.user_id.slice(0, 8)}`,
+            username:
+              byId[r.user_id] || r.username || `user:${r.user_id.slice(0, 8)}`,
           }));
         }
       }
 
-      arr = arr.map((r) => ({ ...r, username: r.username || `user:${r.user_id.slice(0, 8)}` }));
+      arr = arr.map((r) => ({
+        ...r,
+        username: r.username || `user:${r.user_id.slice(0, 8)}`,
+      }));
       setLeaderboardRows(arr);
     } catch (e) {
       console.warn("leaderboard load failed", e);
@@ -1119,12 +2071,10 @@ useEffect(() => {
     }
   }
 
-
-
-
   const clampZoom = (z: number) => Math.max(0.5, Math.min(5, z));
   const zoomIn = () => setZoom((z) => clampZoom(Number((z * 1.15).toFixed(4))));
-  const zoomOut = () => setZoom((z) => clampZoom(Number((z / 1.15).toFixed(4))));
+  const zoomOut = () =>
+    setZoom((z) => clampZoom(Number((z / 1.15).toFixed(4))));
   const zoomReset = () => setZoom(1);
 
   const onPdfWheel: WheelEventHandler<HTMLDivElement> = (e) => {
@@ -1196,11 +2146,10 @@ useEffect(() => {
     return () => window.removeEventListener("popstate", syncFromUrl);
   }, []);
 
-
   async function loadDocAndPdf() {
     if (!PDF_URL || !JSON_URL) {
       setFatalError(
-        "Missing NEXT_PUBLIC_PDF_URL or NEXT_PUBLIC_JSON_URL. Set these in Vercel → Project → Settings → Environment Variables."
+        "Missing NEXT_PUBLIC_PDF_URL or NEXT_PUBLIC_JSON_URL. Set these in Vercel → Project → Settings → Environment Variables.",
       );
       return;
     }
@@ -1216,7 +2165,8 @@ useEffect(() => {
     setDoc(j);
 
     const firstValid =
-      Object.keys(j).find((k) => pageKeyToNumber(k) != null) ?? Object.keys(j)[0];
+      Object.keys(j).find((k) => pageKeyToNumber(k) != null) ??
+      Object.keys(j)[0];
     setPageKey(firstValid);
 
     // Dynamically import pdf.js on the client only.
@@ -1224,7 +2174,7 @@ useEffect(() => {
     const pdfjsLib: any = await import("pdfjs-dist");
     pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
       "pdfjs-dist/build/pdf.worker.min.mjs",
-      import.meta.url
+      import.meta.url,
     ).toString();
 
     const loaded = await pdfjsLib.getDocument(PDF_URL).promise;
@@ -1274,12 +2224,23 @@ useEffect(() => {
       }
     })();
 
+    // viewer locations (for showing the current page location in the header)
+    (async () => {
+      try {
+        if (!DOCUMENT_ID) return;
+        await loadLocationsForViewer(DOCUMENT_ID);
+      } catch (e) {
+        console.warn("viewer locations init failed", e);
+      }
+    })();
+
     return () => sub.subscription.unsubscribe();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function signUp() {
-    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
+    if (!supabase)
+      return alert("Missing Supabase env vars on this deployment.");
     // If the user typed an email in the sign-in modal and signupEmail is empty, reuse it.
     if (!signupEmail.trim() && signinId.trim().includes("@")) {
       setSignupEmail(signinId.trim());
@@ -1304,7 +2265,10 @@ useEffect(() => {
     if (newUserId) {
       const { error: pErr } = await supabase
         .from("profiles")
-        .upsert({ id: newUserId, username: uname, email }, { onConflict: "id" });
+        .upsert(
+          { id: newUserId, username: uname, email },
+          { onConflict: "id" },
+        );
 
       if (pErr) console.warn("profiles upsert failed", pErr);
 
@@ -1313,11 +2277,14 @@ useEffect(() => {
 
     setSignupPw("");
     setShowSignup(false);
-    alert("Signed up. If email confirmation is enabled, confirm your email, then sign in.");
+    alert(
+      "Signed up. If email confirmation is enabled, confirm your email, then sign in.",
+    );
   }
 
   async function signIn() {
-    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
+    if (!supabase)
+      return alert("Missing Supabase env vars on this deployment.");
     const id = signinId.trim();
     if (!id) return alert("Enter your username or email.");
 
@@ -1332,7 +2299,10 @@ useEffect(() => {
         .maybeSingle();
 
       if (pErr) return alert(pErr.message);
-      if (!prof?.email) return alert("No account found for that username (or missing email in profiles).");
+      if (!prof?.email)
+        return alert(
+          "No account found for that username (or missing email in profiles).",
+        );
 
       emailToUse = prof.email;
     }
@@ -1354,8 +2324,10 @@ useEffect(() => {
     if (!supabase) return;
     await supabase.auth.signOut();
   }
+
   async function forgotPassword() {
-    if (!supabase) return alert("Missing Supabase env vars on this deployment.");
+    if (!supabase)
+      return alert("Missing Supabase env vars on this deployment.");
     const raw = signinId.trim();
     if (!raw) return alert("Enter your email (or username) first.");
 
@@ -1369,14 +2341,19 @@ useEffect(() => {
         .maybeSingle();
 
       if (pErr) return alert(pErr.message);
-      if (!prof?.email) return alert("No email found for that username. Please enter your email instead.");
+      if (!prof?.email)
+        return alert(
+          "No email found for that username. Please enter your email instead.",
+        );
       emailToUse = prof.email;
     }
 
     // Where Supabase should send them back after they click the email link
     const redirectTo = `${window.location.origin}`;
 
-    const { error } = await supabase.auth.resetPasswordForEmail(emailToUse, { redirectTo });
+    const { error } = await supabase.auth.resetPasswordForEmail(emailToUse, {
+      redirectTo,
+    });
     if (error) return alert(error.message);
 
     alert("Password reset email sent. Check your inbox.");
@@ -1406,7 +2383,7 @@ useEffect(() => {
         const uniq = new Set(
           (data ?? [])
             .map((r: any) => String(r?.user_id ?? "").trim())
-            .filter((x: string) => x.length > 0)
+            .filter((x: string) => x.length > 0),
         );
 
         setWelcomeStats((prev) => ({ ...prev, volunteers: uniq.size }));
@@ -1415,7 +2392,6 @@ useEffect(() => {
       }
     })();
   }, [supabase, DOCUMENT_ID]);
-
 
   useEffect(() => {
     const el = pdfScrollRef.current;
@@ -1445,23 +2421,13 @@ useEffect(() => {
         await loadLeafletOnce();
         if (cancelled) return;
 
-        // Load docs (markers)
-        const docs = await loadDocsForMap();
+        // Load selectable documents (id + title)
+        const opts = await loadMapDocOptions();
         if (cancelled) return;
 
         const L = (window as any).L;
         const el = mapDivRef.current;
         if (!L || !el) return;
-
-        // Wait until the container has a real size (prevents blank map until refresh)
-        const rect = el.getBoundingClientRect();
-        if (rect.width < 10 || rect.height < 10) {
-          requestAnimationFrame(() => {
-            try {
-              leafletMapRef.current?.invalidateSize?.();
-            } catch {}
-          });
-        }
 
         // Init map once
         if (!leafletMapRef.current) {
@@ -1476,44 +2442,33 @@ useEffect(() => {
           }).addTo(leafletMapRef.current);
         }
 
-        // Refresh markers layer
-        if (leafletLayerRef.current) {
-          try {
-            leafletLayerRef.current.clearLayers();
-          } catch {}
+        // pick a doc id
+        const initialId = selectedMapDocId || "__ALL__";
+        if (!selectedMapDocId && initialId) setSelectedMapDocId(initialId);
+
+        // Load + render trail for selected doc, or aggregates for ALL
+        if (initialId === "__ALL__") {
+          const aggs = await loadAggregatedLocationsAllDocs();
+          if (cancelled) return;
+          renderMapAggregates(aggs);
+        } else if (initialId) {
+          const locs = await loadLocationsForDoc(initialId);
+          if (cancelled) return;
+          renderMapTrail(locs);
         } else {
-          leafletLayerRef.current = L.layerGroup().addTo(leafletMapRef.current);
+          renderMapTrail([]);
         }
 
-        // Add markers
-        for (const d of docs) {
-          const m = L.marker([d.lat, d.lng]);
-          m.bindPopup(`<b>${String(d.title).replace(/</g, "&lt;")}</b>`);
-          m.addTo(leafletLayerRef.current);
-        }
-
-        if (docs.length) {
-          const b = L.latLngBounds(docs.map((d) => [d.lat, d.lng]));
-          leafletMapRef.current.fitBounds(b, { padding: [30, 30] });
-        } else {
-          leafletMapRef.current.setView([20, 0], 2);
-        }
-
-        // Fix sizing when switching views (Leaflet needs a real-sized container)
+        // invalidate size a few times (helps when switching tabs)
         const invalidate = () => {
           try {
             leafletMapRef.current?.invalidateSize?.();
           } catch {}
         };
-
-        // next paint
         requestAnimationFrame(() => {
           invalidate();
-          // one more paint later
-          requestAnimationFrame(() => invalidate());
+          requestAnimationFrame(invalidate);
         });
-
-        // and a couple timed retries for slower layouts
         setTimeout(invalidate, 150);
         setTimeout(invalidate, 400);
       } catch (e: any) {
@@ -1568,6 +2523,44 @@ useEffect(() => {
   }, [viewMode]);
 
   useEffect(() => {
+    if (viewMode !== "map") return;
+    if (typeof window === "undefined") return;
+    if (!(window as any).L) return;
+    if (!leafletMapRef.current) return;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const docId = selectedMapDocId;
+        if (!docId) {
+          renderMapTrail([]);
+          return;
+        }
+
+        if (docId === "__ALL__") {
+          const aggs = await loadAggregatedLocationsAllDocs();
+          if (cancelled) return;
+          renderMapAggregates(aggs);
+          return;
+        }
+
+        const locs = await loadLocationsForDoc(docId);
+        if (cancelled) return;
+        renderMapTrail(locs);
+      } catch (e: any) {
+        console.warn("map trail refresh failed", e);
+        setMapError(e?.message || String(e));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode, selectedMapDocId]);
+
+  useEffect(() => {
     if (!doc || !pdf || !pageKey) return;
     let cancelled = false;
 
@@ -1576,7 +2569,8 @@ useEffect(() => {
     (async () => {
       const n = pageKeyToNumber(pageKey);
       if (!n) throw new Error(`Bad page key: ${pageKey}`);
-      if (n < 1 || n > pdf.numPages) throw new Error(`Page ${n} out of range (PDF has ${pdf.numPages})`);
+      if (n < 1 || n > pdf.numPages)
+        throw new Error(`Page ${n} out of range (PDF has ${pdf.numPages})`);
 
       const page = await pdf.getPage(n);
 
@@ -1602,7 +2596,8 @@ useEffect(() => {
       } catch {}
       renderTaskRef.current = null;
 
-      const baseWidth = pdfViewportWidth || Math.floor(window.innerWidth * 0.48);
+      const baseWidth =
+        pdfViewportWidth || Math.floor(window.innerWidth * 0.48);
       const targetCssWidth = Math.max(200, Math.floor(baseWidth * zoom));
       const viewport1 = page.getViewport({ scale: 1 });
       const scale = targetCssWidth / viewport1.width;
@@ -1651,7 +2646,14 @@ useEffect(() => {
 
       const pageObj = doc[pageKey];
       const lines = pageObj ? getAllLinesForPage(pageObj) : [];
-      const nextHitBoxes: Array<{ uid: string; x: number; y: number; w: number; h: number; area: number }> = [];
+      const nextHitBoxes: Array<{
+        uid: string;
+        x: number;
+        y: number;
+        w: number;
+        h: number;
+        area: number;
+      }> = [];
 
       for (const l of lines) {
         const pageW = pageObj!.width;
@@ -1660,14 +2662,17 @@ useEffect(() => {
         const [x1p, y1p, x2p, y2p] = l.bbox;
 
         // Guard against bad data
-        if (![x1p, y1p, x2p, y2p, pageW, pageH].every((v) => Number.isFinite(v))) continue;
+        if (
+          ![x1p, y1p, x2p, y2p, pageW, pageH].every((v) => Number.isFinite(v))
+        )
+          continue;
         if (pageW <= 0 || pageH <= 0) continue;
 
         let x1n = x1p / pageW;
         let x2n = x2p / pageW;
         let y1n = y1p / pageH;
         let y2n = y2p / pageH;
-        
+
         // Clamp to [0,1]
         x1n = Math.min(1, Math.max(0, x1n));
         x2n = Math.min(1, Math.max(0, x2n));
@@ -1685,17 +2690,26 @@ useEffect(() => {
         if (w <= 0 || h <= 0) continue;
 
         // Lines should be thin; skip paragraph/page-sized boxes
-        if (h > 0.20) continue;
+        if (h > 0.2) continue;
         if (area > 0.25) continue;
-        if (w > 0.98 && h > 0.50) continue;
+        if (w > 0.98 && h > 0.5) continue;
         if (w > 0.95 && h > 0.95) continue;
 
         // Extra safety: skip any box that is suspiciously large in either dimension
         if (w > 0.999 || h > 0.999) continue;
 
-        if (process.env.NODE_ENV !== "production" && (h > 0.08 || area > 0.08)) {
+        if (
+          process.env.NODE_ENV !== "production" &&
+          (h > 0.08 || area > 0.08)
+        ) {
           // eslint-disable-next-line no-console
-          console.warn("Large bbox (from bbox pixels)", { uid: l.uid, bbox: l.bbox, w, h, area });
+          console.warn("Large bbox (from bbox pixels)", {
+            uid: l.uid,
+            bbox: l.bbox,
+            w,
+            h,
+            area,
+          });
         }
 
         boxByUidRef.current[l.uid] = { x: x1n, y: y1n, w, h };
@@ -1706,200 +2720,216 @@ useEffect(() => {
       nextHitBoxes.sort((a, b) => a.area - b.area);
       setHitBoxes(nextHitBoxes);
 
+      // Build paragraph/list/table-level boxes + text (for paragraph transcription mode)
+      // IMPORTANT: keep items in page reading order by sorting by their top-left bbox.
+      const parItems: Array<{
+        pid: string;
+        text: string;
+        box: { x: number; y: number; w: number; h: number };
+      }> = [];
+      const pars = pageObj?.paragraphs || [];
+      const pageW = pageObj!.width;
+      const pageH = pageObj!.height;
 
+      // Helper: get a normalized box from a block-like object.
+      // Prefer pixel bbox if present; fall back to bboxn if present.
+      const normBoxFromAny = (
+        blk: any,
+      ): { x: number; y: number; w: number; h: number } | null => {
+        if (!blk) return null;
 
+        // Prefer pixel bbox
+        if (Array.isArray(blk.bbox) && blk.bbox.length === 4) {
+          const nb = normBoxFromPixels(blk.bbox as any, pageW, pageH);
+          if (nb) return { x: nb.x, y: nb.y, w: nb.w, h: nb.h };
+        }
 
+        // Fall back to normalized bbox
+        if (Array.isArray(blk.bboxn) && blk.bboxn.length === 4) {
+          const [x1n, y1n, x2n, y2n] = blk.bboxn as any;
+          if (![x1n, y1n, x2n, y2n].every((v) => Number.isFinite(v)))
+            return null;
 
+          const x1 = Math.min(1, Math.max(0, Math.min(x1n, x2n)));
+          const x2 = Math.min(1, Math.max(0, Math.max(x1n, x2n)));
+          const y1 = Math.min(1, Math.max(0, Math.min(y1n, y2n)));
+          const y2 = Math.min(1, Math.max(0, Math.max(y1n, y2n)));
 
+          const w = Math.max(0, x2 - x1);
+          const h = Math.max(0, y2 - y1);
+          if (w <= 0 || h <= 0) return null;
 
+          return { x: x1, y: y1, w, h };
+        }
 
+        return null;
+      };
 
+      // 1) Paragraphs (existing behavior)
+      for (let pIdx = 0; pIdx < pars.length; pIdx++) {
+        const par: any = pars[pIdx];
+        const linesInPar: any[] = Array.isArray(par?.lines) ? par.lines : [];
 
-     // Build paragraph/list/table-level boxes + text (for paragraph transcription mode)
-    // IMPORTANT: keep items in page reading order by sorting by their top-left bbox.
-    const parItems: Array<{ pid: string; text: string; box: { x: number; y: number; w: number; h: number } }> = [];
-    const pars = pageObj?.paragraphs || [];
-    const pageW = pageObj!.width;
-    const pageH = pageObj!.height;
+        let minX = 1,
+          minY = 1,
+          maxX = 0,
+          maxY = 0;
+        let found = false;
 
-    // Helper: get a normalized box from a block-like object.
-    // Prefer pixel bbox if present; fall back to bboxn if present.
-    const normBoxFromAny = (blk: any): { x: number; y: number; w: number; h: number } | null => {
-      if (!blk) return null;
+        for (const ln of linesInPar) {
+          const nb = normBoxFromPixels(ln.bbox, pageW, pageH);
+          if (!nb) continue;
+          found = true;
+          minX = Math.min(minX, nb.x);
+          minY = Math.min(minY, nb.y);
+          maxX = Math.max(maxX, nb.x + nb.w);
+          maxY = Math.max(maxY, nb.y + nb.h);
+        }
 
-      // Prefer pixel bbox
-      if (Array.isArray(blk.bbox) && blk.bbox.length === 4) {
-        const nb = normBoxFromPixels(blk.bbox as any, pageW, pageH);
-        if (nb) return { x: nb.x, y: nb.y, w: nb.w, h: nb.h };
+        if (!found) continue;
+
+        minX = Math.min(1, Math.max(0, minX));
+        minY = Math.min(1, Math.max(0, minY));
+        maxX = Math.min(1, Math.max(0, maxX));
+        maxY = Math.min(1, Math.max(0, maxY));
+
+        const box = {
+          x: minX,
+          y: minY,
+          w: Math.max(0, maxX - minX),
+          h: Math.max(0, maxY - minY),
+        };
+        if (box.w <= 0 || box.h <= 0) continue;
+
+        const llmText = (par?.llm_text ?? "").toString().trim();
+        const fallbackText = (linesInPar || [])
+          .map((x: any) => String(x?.transcription ?? ""))
+          .join("\n")
+          .trim();
+        const text = llmText || fallbackText;
+
+        parItems.push({ pid: `p-${pIdx}`, text, box });
       }
 
-      // Fall back to normalized bbox
-      if (Array.isArray(blk.bboxn) && blk.bboxn.length === 4) {
-        const [x1n, y1n, x2n, y2n] = blk.bboxn as any;
-        if (![x1n, y1n, x2n, y2n].every((v) => Number.isFinite(v))) return null;
+      // 2) Lists (if present in JSON)
+      // Robust: your JSON may call it `lists` or `list`.
+      const listsAny: any[] = Array.isArray((pageObj as any)?.lists)
+        ? (pageObj as any).lists
+        : Array.isArray((pageObj as any)?.list)
+          ? (pageObj as any).list
+          : [];
 
-        const x1 = Math.min(1, Math.max(0, Math.min(x1n, x2n)));
-        const x2 = Math.min(1, Math.max(0, Math.max(x1n, x2n)));
-        const y1 = Math.min(1, Math.max(0, Math.min(y1n, y2n)));
-        const y2 = Math.min(1, Math.max(0, Math.max(y1n, y2n)));
+      for (let i = 0; i < listsAny.length; i++) {
+        const blk: any = listsAny[i];
+        const box = normBoxFromAny(blk);
+        if (!box) continue;
 
-        const w = Math.max(0, x2 - x1);
-        const h = Math.max(0, y2 - y1);
-        if (w <= 0 || h <= 0) return null;
+        const llmText = (blk?.llm_text ?? blk?.text ?? "").toString().trim();
+        const items = Array.isArray(blk?.items)
+          ? blk.items
+          : Array.isArray(blk?.lines)
+            ? blk.lines
+            : [];
+        const fallback = Array.isArray(items)
+          ? items
+              .map((x: any) => {
+                if (typeof x === "string") return x;
+                return String(x?.text ?? x?.transcription ?? "");
+              })
+              .filter((s: string) => s.trim().length)
+              .join("\n")
+              .trim()
+          : "";
 
-        return { x: x1, y: y1, w, h };
+        const text = llmText || fallback || "(List)";
+        parItems.push({ pid: `list-${i}`, text, box });
       }
 
-      return null;
-    };
+      // 3) Tables (if present in JSON)
+      const tablesAny: any[] = Array.isArray((pageObj as any)?.tables)
+        ? (pageObj as any).tables
+        : Array.isArray((pageObj as any)?.table)
+          ? (pageObj as any).table
+          : [];
 
-    // 1) Paragraphs (existing behavior)
-    for (let pIdx = 0; pIdx < pars.length; pIdx++) {
-      const par: any = pars[pIdx];
-      const linesInPar: any[] = Array.isArray(par?.lines) ? par.lines : [];
+      for (let i = 0; i < tablesAny.length; i++) {
+        const blk: any = tablesAny[i];
+        const box = normBoxFromAny(blk);
+        if (!box) continue;
 
-      let minX = 1, minY = 1, maxX = 0, maxY = 0;
-      let found = false;
+        const llmText = (blk?.llm_text ?? blk?.text ?? "").toString().trim();
 
-      for (const ln of linesInPar) {
-        const nb = normBoxFromPixels(ln.bbox, pageW, pageH);
-        if (!nb) continue;
-        found = true;
-        minX = Math.min(minX, nb.x);
-        minY = Math.min(minY, nb.y);
-        maxX = Math.max(maxX, nb.x + nb.w);
-        maxY = Math.max(maxY, nb.y + nb.h);
-      }
-
-      if (!found) continue;
-
-      minX = Math.min(1, Math.max(0, minX));
-      minY = Math.min(1, Math.max(0, minY));
-      maxX = Math.min(1, Math.max(0, maxX));
-      maxY = Math.min(1, Math.max(0, maxY));
-
-      const box = { x: minX, y: minY, w: Math.max(0, maxX - minX), h: Math.max(0, maxY - minY) };
-      if (box.w <= 0 || box.h <= 0) continue;
-
-      const llmText = (par?.llm_text ?? "").toString().trim();
-      const fallbackText = (linesInPar || [])
-        .map((x: any) => String(x?.transcription ?? ""))
-        .join("\n")
-        .trim();
-      const text = llmText || fallbackText;
-
-      parItems.push({ pid: `p-${pIdx}`, text, box });
-    }
-
-    // 2) Lists (if present in JSON)
-    // Robust: your JSON may call it `lists` or `list`.
-    const listsAny: any[] = Array.isArray((pageObj as any)?.lists)
-      ? (pageObj as any).lists
-      : Array.isArray((pageObj as any)?.list)
-      ? (pageObj as any).list
-      : [];
-
-    for (let i = 0; i < listsAny.length; i++) {
-      const blk: any = listsAny[i];
-      const box = normBoxFromAny(blk);
-      if (!box) continue;
-
-      const llmText = (blk?.llm_text ?? blk?.text ?? "").toString().trim();
-      const items = Array.isArray(blk?.items) ? blk.items : Array.isArray(blk?.lines) ? blk.lines : [];
-      const fallback = Array.isArray(items)
-        ? items
-            .map((x: any) => {
-              if (typeof x === "string") return x;
-              return String(x?.text ?? x?.transcription ?? "");
+        // Try to build a readable fallback from common table shapes
+        let fallback = "";
+        const rows = Array.isArray(blk?.rows)
+          ? blk.rows
+          : Array.isArray(blk?.data)
+            ? blk.data
+            : null;
+        if (rows && Array.isArray(rows)) {
+          fallback = rows
+            .map((r: any) => {
+              if (Array.isArray(r))
+                return r
+                  .map((c) => String(c ?? "").trim())
+                  .filter(Boolean)
+                  .join("\t");
+              if (typeof r === "object" && r) {
+                return Object.keys(r)
+                  .sort()
+                  .map((k) => String(r[k] ?? "").trim())
+                  .filter(Boolean)
+                  .join("\t");
+              }
+              return String(r ?? "").trim();
             })
             .filter((s: string) => s.trim().length)
             .join("\n")
-            .trim()
-        : "";
+            .trim();
+        }
 
-      const text = llmText || fallback || "(List)";
-      parItems.push({ pid: `list-${i}`, text, box });
-    }
-
-    // 3) Tables (if present in JSON)
-    const tablesAny: any[] = Array.isArray((pageObj as any)?.tables)
-      ? (pageObj as any).tables
-      : Array.isArray((pageObj as any)?.table)
-      ? (pageObj as any).table
-      : [];
-
-    for (let i = 0; i < tablesAny.length; i++) {
-      const blk: any = tablesAny[i];
-      const box = normBoxFromAny(blk);
-      if (!box) continue;
-
-      const llmText = (blk?.llm_text ?? blk?.text ?? "").toString().trim();
-
-      // Try to build a readable fallback from common table shapes
-      let fallback = "";
-      const rows = Array.isArray(blk?.rows) ? blk.rows : Array.isArray(blk?.data) ? blk.data : null;
-      if (rows && Array.isArray(rows)) {
-        fallback = rows
-          .map((r: any) => {
-            if (Array.isArray(r)) return r.map((c) => String(c ?? "").trim()).filter(Boolean).join("\t");
-            if (typeof r === "object" && r) {
-              return Object.keys(r)
-                .sort()
-                .map((k) => String(r[k] ?? "").trim())
-                .filter(Boolean)
-                .join("\t");
-            }
-            return String(r ?? "").trim();
-          })
-          .filter((s: string) => s.trim().length)
-          .join("\n")
-          .trim();
+        const text = llmText || fallback || "(Table)";
+        parItems.push({ pid: `table-${i}`, text, box });
       }
 
-      const text = llmText || fallback || "(Table)";
-      parItems.push({ pid: `table-${i}`, text, box });
-    }
+      // Sort ALL items by reading order.
+      // If the PDF page is actually a 2-page spread (left page + right page scanned together),
+      // order by page-half first (left half, then right half), then by y then x.
+      // Otherwise, order by y then x.
+      const centers: number[] = parItems
+        .map((it) => it.box.x + it.box.w * 0.5)
+        .filter((v) => Number.isFinite(v));
 
-    // Sort ALL items by reading order.
-    // If the PDF page is actually a 2-page spread (left page + right page scanned together),
-    // order by page-half first (left half, then right half), then by y then x.
-    // Otherwise, order by y then x.
-
-    const centers: number[] = parItems
-      .map((it) => it.box.x + it.box.w * 0.5)
-      .filter((v) => Number.isFinite(v));
-
-    let isTwoPageSpread = false;
-    if (centers.length >= 6) {
-      const leftCount = centers.filter((c) => c < 0.45).length;
-      const rightCount = centers.filter((c) => c > 0.55).length;
-      const fracLeft = leftCount / centers.length;
-      const fracRight = rightCount / centers.length;
-      if (fracLeft > 0.20 && fracRight > 0.20) isTwoPageSpread = true;
-    }
-
-    parItems.sort((a, b) => {
-      const aCenter = a.box.x + a.box.w * 0.5;
-      const bCenter = b.box.x + b.box.w * 0.5;
-
-      if (isTwoPageSpread) {
-        const halfA = aCenter < 0.5 ? 0 : 1;
-        const halfB = bCenter < 0.5 ? 0 : 1;
-        if (halfA !== halfB) return halfA - halfB; // left half first
+      let isTwoPageSpread = false;
+      if (centers.length >= 6) {
+        const leftCount = centers.filter((c) => c < 0.45).length;
+        const rightCount = centers.filter((c) => c > 0.55).length;
+        const fracLeft = leftCount / centers.length;
+        const fracRight = rightCount / centers.length;
+        if (fracLeft > 0.2 && fracRight > 0.2) isTwoPageSpread = true;
       }
 
-      const dy = a.box.y - b.box.y;
-      if (Math.abs(dy) > 0.002) return dy;
+      parItems.sort((a, b) => {
+        const aCenter = a.box.x + a.box.w * 0.5;
+        const bCenter = b.box.x + b.box.w * 0.5;
 
-      const dx = a.box.x - b.box.x;
-      if (Math.abs(dx) > 0.002) return dx;
+        if (isTwoPageSpread) {
+          const halfA = aCenter < 0.5 ? 0 : 1;
+          const halfB = bCenter < 0.5 ? 0 : 1;
+          if (halfA !== halfB) return halfA - halfB; // left half first
+        }
 
-      // Stable tie-breaker
-      return String(a.pid).localeCompare(String(b.pid));
-    });
+        const dy = a.box.y - b.box.y;
+        if (Math.abs(dy) > 0.002) return dy;
 
-    setParagraphItems(parItems);
+        const dx = a.box.x - b.box.x;
+        if (Math.abs(dx) > 0.002) return dx;
 
+        // Stable tie-breaker
+        return String(a.pid).localeCompare(String(b.pid));
+      });
+
+      setParagraphItems(parItems);
 
       if (scroller && prevScroll) {
         requestAnimationFrame(() => {
@@ -1911,8 +2941,7 @@ useEffect(() => {
           scroller.scrollTop = Math.max(0, Math.floor(y * newH));
         });
       }
-
-    })().catch(e => {
+    })().catch((e) => {
       console.error(e);
       alert(e?.message || String(e));
     });
@@ -1924,7 +2953,6 @@ useEffect(() => {
       } catch {}
     };
   }, [doc, pdf, pageKey, zoom, pdfViewportWidth, viewMode]);
-
 
   // Apply a pending Low Confidence jump after the page has rendered its boxes
   useEffect(() => {
@@ -1942,6 +2970,9 @@ useEffect(() => {
     // Ensure community suggestions visible for the target
     setCollapseSuggestions(false);
 
+    setIsDrawingLowConfBox(false);
+    setDrawPreviewBox(null);
+
     // Clear once applied
     setPendingLowConfJump(null);
   }, [pendingLowConfJump, pageKey]);
@@ -1950,6 +2981,7 @@ useEffect(() => {
     if (!autoScrollEnabled) return;
     if (!activeParagraphId) return;
     if (activeSource !== "left" && activeSource !== "menu") return;
+    if (lowConfLockKey || isDrawingLowConfBox) return;
 
     const el = paragraphElByIdRef.current[String(activeParagraphId)];
     const container = rightScrollRef.current;
@@ -1974,6 +3006,7 @@ useEffect(() => {
     if (!autoScrollEnabled) return;
     if (!activeId) return;
     if (activeSource !== "left" && activeSource !== "menu") return;
+    if (lowConfLockKey || isDrawingLowConfBox) return;
 
     const el = lineElByIdRef.current[String(activeId)];
     const container = rightScrollRef.current;
@@ -2005,7 +3038,11 @@ useEffect(() => {
   }
 
   function pickParagraphAt(u: number, v: number) {
-    let best: { pid: string; box: { x: number; y: number; w: number; h: number }; area: number } | null = null;
+    let best: {
+      pid: string;
+      box: { x: number; y: number; w: number; h: number };
+      area: number;
+    } | null = null;
     for (const p of paragraphItems) {
       const b = p.box;
       if (u >= b.x && u <= b.x + b.w && v >= b.y && v <= b.y + b.h) {
@@ -2019,6 +3056,8 @@ useEffect(() => {
   const onHitSvgClick: MouseEventHandler<SVGSVGElement> = (e) => {
     // If the user is drag-panning (zoomed-in), don't treat this as a click.
     if (isDraggingRef.current) return;
+    if (lowConfLockKey || isDrawingLowConfBox) return;
+    if (isDrawingLowConfBox) return;
 
     // If this PDF page has no transcription JSON, there's nothing to open.
     if (!doc || !pageKey || !doc[pageKey]) return;
@@ -2086,29 +3125,149 @@ useEffect(() => {
     setOpenSuggestUid(null);
   };
 
+  const onHitSvgMouseDown: MouseEventHandler<SVGSVGElement> = (e) => {
+    if (!isDrawingLowConfBox) return;
+    if (isDraggingRef.current) return;
+    if (e.button !== 0) return;
+    if (!doc || !pageKey || !doc[pageKey]) return;
+    if (transcriptionMode !== "paragraph") return;
+    if (!activeParagraphId) return;
 
+    // only allow drawing when the active paragraph/list/table is low confidence on this page
+    if (!lowConfByPid[String(activeParagraphId)]) return;
+
+    const lockKey = `${pageKey}|${String(activeParagraphId)}`;
+    beginLowConfLock(lockKey);
+
+    setDrawHoverBox(null);
+
+    const svg = e.currentTarget;
+    const r = svg.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
+
+    const u = (e.clientX - r.left) / r.width;
+    const v = (e.clientY - r.top) / r.height;
+    const x = Math.min(1, Math.max(0, u));
+    const y = Math.min(1, Math.max(0, v));
+
+    drawStartRef.current = { x, y };
+    setDrawPreviewBox({ x, y, w: 0, h: 0 });
+    setDrawHoverBox(null);
+
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const onHitSvgMouseUp: MouseEventHandler<SVGSVGElement> = (e) => {
+    if (!isDrawingLowConfBox) return;
+    const start = drawStartRef.current;
+    if (!start) return;
+
+    const svg = e.currentTarget;
+    const r = svg.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
+
+    const u = (e.clientX - r.left) / r.width;
+    const v = (e.clientY - r.top) / r.height;
+    const endX = Math.min(1, Math.max(0, u));
+    const endY = Math.min(1, Math.max(0, v));
+
+    const x1 = Math.min(start.x, endX);
+    const y1 = Math.min(start.y, endY);
+    const x2 = Math.max(start.x, endX);
+    const y2 = Math.max(start.y, endY);
+
+    const w = Math.max(0, x2 - x1);
+    const h = Math.max(0, y2 - y1);
+
+    // ignore tiny drags
+    if (w >= 0.003 && h >= 0.003 && activeParagraphId) {
+      const key = `${pageKey}|${String(activeParagraphId)}`;
+      setLowConfDrawnBoxByKey((prev) => ({
+        ...prev,
+        [key]: { x: x1, y: y1, w, h },
+      }));
+    }
+
+    drawStartRef.current = null;
+    setDrawPreviewBox(null);
+    setDrawHoverBox(null);
+    setIsDrawingLowConfBox(false);
+    setDrawHoverBox(null);
+
+    e.preventDefault();
+    e.stopPropagation();
+  };
 
   function getSortedSuggestions(uid: string) {
-  const arr = suggestionsByUid[uid] ? [...suggestionsByUid[uid]] : [];
-  const mode = sortModeByUid[uid] ?? "top";
+    const arr = suggestionsByUid[uid] ? [...suggestionsByUid[uid]] : [];
+    const mode = sortModeByUid[uid] ?? "top";
 
-  if (mode === "newest") {
-    arr.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    if (mode === "newest") {
+      arr.sort(
+        (a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      );
+      return arr;
+    }
+
+    // "top": votes desc, then newest
+    arr.sort((a, b) => {
+      const va = a.vote_count ?? 0;
+      const vb = b.vote_count ?? 0;
+      if (vb !== va) return vb - va;
+      return (
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      );
+    });
+
     return arr;
   }
 
-  // "top": votes desc, then newest
-  arr.sort((a, b) => {
-    const va = a.vote_count ?? 0;
-    const vb = b.vote_count ?? 0;
-    if (vb !== va) return vb - va;
-    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-  });
-
-  return arr;
-  }
-
   const onHitSvgMouseMove: MouseEventHandler<SVGSVGElement> = (e) => {
+    // While locked OR drawing mode is enabled (but not dragging yet), show hovered block boxes on the PDF
+    // but do NOT change the active selection (right-panel highlight).
+    if ((lowConfLockKey || isDrawingLowConfBox) && !drawStartRef.current) {
+      const svg = e.currentTarget;
+      const r = svg.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        const u = (e.clientX - r.left) / r.width;
+        const v = (e.clientY - r.top) / r.height;
+        const uu = Math.min(1, Math.max(0, u));
+        const vv = Math.min(1, Math.max(0, v));
+
+        const pickedP = pickParagraphAt(uu, vv);
+        setDrawHoverBox(pickedP ? pickedP.box : null);
+      }
+      return;
+    }
+
+    // If we're drawing a corrected bbox, update the preview box and skip hover behavior.
+    if (isDrawingLowConfBox && drawStartRef.current) {
+      const svg = e.currentTarget;
+      const r = svg.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+
+      const u = (e.clientX - r.left) / r.width;
+      const v = (e.clientY - r.top) / r.height;
+      const endX = Math.min(1, Math.max(0, u));
+      const endY = Math.min(1, Math.max(0, v));
+
+      const start = drawStartRef.current;
+      const x1 = Math.min(start.x, endX);
+      const y1 = Math.min(start.y, endY);
+      const x2 = Math.max(start.x, endX);
+      const y2 = Math.max(start.y, endY);
+
+      setDrawPreviewBox({
+        x: x1,
+        y: y1,
+        w: Math.max(0, x2 - x1),
+        h: Math.max(0, y2 - y1),
+      });
+      return;
+    }
+
     const svg = e.currentTarget;
     const r = svg.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return;
@@ -2134,7 +3293,8 @@ useEffect(() => {
         const pickedP = pickParagraphAt(uu, vv);
         if (!pickedP) return;
 
-        if (activeParagraphId === pickedP.pid && activeSource === "left") return;
+        if (activeParagraphId === pickedP.pid && activeSource === "left")
+          return;
 
         setActiveSource("left");
         setActiveParagraphId(pickedP.pid);
@@ -2157,24 +3317,42 @@ useEffect(() => {
 
   const onHitSvgMouseLeave: MouseEventHandler<SVGSVGElement> = () => {
     hoverPtRef.current = null;
+    if (lowConfLockKey || isDrawingLowConfBox) {
+      setDrawHoverBox(null);
+      hoverPtRef.current = null;
+      if (hoverRafRef.current != null) {
+        cancelAnimationFrame(hoverRafRef.current);
+        hoverRafRef.current = null;
+      }
+      return;
+    }
     if (hoverRafRef.current != null) {
       cancelAnimationFrame(hoverRafRef.current);
       hoverRafRef.current = null;
     }
+
+    // While in drawing mode, do NOT clear active selection/highlights.
+    if (isDrawingLowConfBox) {
+      setDrawHoverBox(null);
+      return;
+    }
+
     setActiveSource(null);
     setActiveId(null);
     setActiveParagraphId(null);
     setActiveBox(null);
   };
 
-
   if (started && (missingEnv.length || !supabase)) {
     return (
       <div style={{ padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
-        <div style={{ fontWeight: 900, fontSize: 16 }}>Missing required environment variables</div>
+        <div style={{ fontWeight: 900, fontSize: 16 }}>
+          Missing required environment variables
+        </div>
         <div style={{ marginTop: 8, opacity: 0.85 }}>
-          This deployment is missing one or more <code>NEXT_PUBLIC_*</code> variables. Add them in Vercel → Project → Settings → Environment Variables,
-          then redeploy.
+          This deployment is missing one or more <code>NEXT_PUBLIC_*</code>{" "}
+          variables. Add them in Vercel → Project → Settings → Environment
+          Variables, then redeploy.
         </div>
         <ul style={{ marginTop: 10 }}>
           {missingEnv.map((k) => (
@@ -2238,12 +3416,7 @@ useEffect(() => {
             textAlign: "center",
           }}
         >
-          <div
-            style={{
-              maxWidth: 780,
-              width: "100%",
-            }}
-          >
+          <div style={{ maxWidth: 780, width: "100%" }}>
             <div
               style={{
                 fontWeight: 900,
@@ -2270,7 +3443,13 @@ useEffect(() => {
               Every word you transcribe brings a piece of history back to life.
             </div>
 
-            <div style={{ marginTop: 22, display: "flex", justifyContent: "center" }}>
+            <div
+              style={{
+                marginTop: 22,
+                display: "flex",
+                justifyContent: "center",
+              }}
+            >
               <button
                 type="button"
                 onClick={() => {
@@ -2341,15 +3520,24 @@ useEffect(() => {
             >
               {[
                 {
-                  big: typeof welcomeStats.pages === "number" ? welcomeStats.pages.toLocaleString() : "—",
+                  big:
+                    typeof welcomeStats.pages === "number"
+                      ? welcomeStats.pages.toLocaleString()
+                      : "—",
                   small: "Pages Available",
                 },
                 {
-                  big: typeof welcomeStats.lines === "number" ? welcomeStats.lines.toLocaleString() : "—",
+                  big:
+                    typeof welcomeStats.lines === "number"
+                      ? welcomeStats.lines.toLocaleString()
+                      : "—",
                   small: "Lines Available",
                 },
                 {
-                  big: typeof welcomeStats.volunteers === "number" ? welcomeStats.volunteers.toLocaleString() : "—",
+                  big:
+                    typeof welcomeStats.volunteers === "number"
+                      ? welcomeStats.volunteers.toLocaleString()
+                      : "—",
                   small: "Active Volunteers",
                 },
               ].map((s) => (
@@ -2363,8 +3551,14 @@ useEffect(() => {
                     backdropFilter: "blur(6px)",
                   }}
                 >
-                  <div style={{ fontWeight: 900, fontSize: 22, lineHeight: 1.1 }}>{s.big}</div>
-                  <div style={{ fontSize: 12, opacity: 0.92, marginTop: 4 }}>{s.small}</div>
+                  <div
+                    style={{ fontWeight: 900, fontSize: 22, lineHeight: 1.1 }}
+                  >
+                    {s.big}
+                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.92, marginTop: 4 }}>
+                    {s.small}
+                  </div>
                 </div>
               ))}
             </div>
@@ -2375,7 +3569,7 @@ useEffect(() => {
   }
 
   if (!doc) return <div style={{ padding: 16 }}>Loading…</div>;
-
+  const hasTranscriptionForPage = !!(pageKey && doc && doc[pageKey]);
   const lines = pageKey && doc[pageKey] ? getAllLinesForPage(doc[pageKey]) : [];
 
   // ---------- UI helpers (inline styles) ----------
@@ -2389,7 +3583,8 @@ useEffect(() => {
     boxShadow: "0 1px 2px rgba(0,0,0,0.10)",
     outline: "none",
     appearance: "none",
-    transition: "transform 120ms ease, box-shadow 120ms ease, background 120ms ease",
+    transition:
+      "transform 120ms ease, box-shadow 120ms ease, background 120ms ease",
     userSelect: "none",
     WebkitTapHighlightColor: "transparent",
   };
@@ -2401,12 +3596,12 @@ useEffect(() => {
   };
 
   const btnSecondary: React.CSSProperties = {
-  ...btnBase,
-  background: "transparent",
-  boxShadow: "none",
-  border: "1px solid rgba(0,0,0,0.14)",
-  fontWeight: 800,
-  color: "rgba(0,0,0,0.75)",
+    ...btnBase,
+    background: "transparent",
+    boxShadow: "none",
+    border: "1px solid rgba(0,0,0,0.14)",
+    fontWeight: 800,
+    color: "rgba(0,0,0,0.75)",
   };
 
   const btnTiny: React.CSSProperties = {
@@ -2538,7 +3733,9 @@ useEffect(() => {
           lat: Number(r?.lat),
           lng: Number(r?.lng),
         }))
-        .filter((d) => d.id && Number.isFinite(d.lat) && Number.isFinite(d.lng));
+        .filter(
+          (d) => d.id && Number.isFinite(d.lat) && Number.isFinite(d.lng),
+        );
 
       setMapDocs(docs);
       return docs;
@@ -2581,7 +3778,6 @@ useEffect(() => {
     );
   }
 
-
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
       {/* Global header (does not scroll) */}
@@ -2595,12 +3791,14 @@ useEffect(() => {
           padding: "0 16px",
           borderBottom: "1px solid #e6e6e6",
           background: "white",
-          zIndex: 5,
+          zIndex: 10,
           flex: "0 0 auto",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ fontWeight: 900, fontSize: 18 }}>Hudson&apos;s Bay Company Records</div>
+          <div style={{ fontWeight: 900, fontSize: 18 }}>
+            Hudson&apos;s Bay Company Records
+          </div>
 
           <button
             type="button"
@@ -2622,7 +3820,9 @@ useEffect(() => {
                   {},
                   "",
                   url.pathname +
-                    (url.searchParams.toString() ? `?${url.searchParams.toString()}` : "")
+                    (url.searchParams.toString()
+                      ? `?${url.searchParams.toString()}`
+                      : ""),
                 );
               } catch {}
             }}
@@ -2640,28 +3840,44 @@ useEffect(() => {
           </button>
 
           {isLoadingSuggestions ? (
-            <div style={{ fontSize: 12, opacity: 0.75, whiteSpace: "nowrap" }}>Loading…</div>
+            <div style={{ fontSize: 12, opacity: 0.75, whiteSpace: "nowrap" }}>
+              Loading…
+            </div>
           ) : null}
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            flexWrap: "wrap",
+          }}
+        >
           <div style={{ position: "relative" }}>
             <button
+              ref={lowConfBtnRef}
               type="button"
               onClick={() => setShowLowConfidenceMenu((v) => !v)}
               style={btnBase}
               onMouseDown={preventMouseDownFocus}
               onFocus={blurOnFocus}
-              onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-              onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+              onMouseEnter={(e) =>
+                (e.currentTarget.style.transform = "translateY(1px)")
+              }
+              onMouseLeave={(e) =>
+                (e.currentTarget.style.transform = "translateY(0px)")
+              }
               aria-expanded={showLowConfidenceMenu}
               title="Pages/blocks where class confidence is below 50"
             >
-              Low Confidence Pages{lowConfItems.length ? ` (${lowConfItems.length})` : ""}
+              Low Confidence Pages
+              {lowConfItems.length ? ` (${lowConfItems.length})` : ""}
             </button>
 
             {showLowConfidenceMenu ? (
               <div
+                ref={lowConfMenuRef}
                 onMouseDown={(e) => e.stopPropagation()}
                 style={{
                   position: "absolute",
@@ -2678,8 +3894,17 @@ useEffect(() => {
                   zIndex: 9999,
                 }}
               >
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-                  <div style={{ fontWeight: 900, fontSize: 13, opacity: 0.85 }}>Low confidence blocks</div>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    gap: 10,
+                  }}
+                >
+                  <div style={{ fontWeight: 900, fontSize: 13, opacity: 0.85 }}>
+                    Low confidence blocks
+                  </div>
                   <button
                     type="button"
                     onClick={() => setShowLowConfidenceMenu(false)}
@@ -2702,75 +3927,78 @@ useEffect(() => {
 
                 <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
                   {lowConfItems.length ? (
-                    lowConfItems.map((it, idx) => (
-                <div
-                  key={`${it.pageKey}|${it.targetPid}`}
-                  onClick={() => {
-                    setShowLowConfidenceMenu(false);
-
-                    if (it.pageKey !== pageKey) {
-                      setPageKey(it.pageKey);
-                    }
-
-                    setPendingLowConfJump({
-                      pageKey: it.pageKey,
-                      targetPid: it.targetPid,
-                      box: it.box || { x: 0, y: 0, w: 0, h: 0 },
-                    });
-                  }}
-                  style={{
-                    padding: 12,
-                    borderRadius: 12,
-                    border: "1px solid rgba(0,0,0,0.10)",
-                    background: "white",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: 12,
-                    cursor: "pointer",
-                  }}
-                >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 12,
-                        width: "100%",
-                      }}
-                    >
+                    lowConfItems.map((it) => (
                       <div
+                        key={`${it.pageKey}|${it.targetPid}`}
+                        onClick={() => {
+                          setShowLowConfidenceMenu(false);
+
+                          if (it.pageKey !== pageKey) {
+                            setPageKey(it.pageKey);
+                          }
+
+                          setPendingLowConfJump({
+                            pageKey: it.pageKey,
+                            targetPid: it.targetPid,
+                            box: it.box || { x: 0, y: 0, w: 0, h: 0 },
+                          });
+                        }}
                         style={{
-                          fontWeight: 900,
-                          fontSize: 14,
-                          minWidth: 0,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
+                          padding: 12,
+                          borderRadius: 12,
+                          border: "1px solid rgba(0,0,0,0.10)",
+                          background: "white",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 12,
+                          cursor: "pointer",
                         }}
                       >
-                        Page {it.pageNum ?? ""} • {it.label}
-                      </div>
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 12,
+                            width: "100%",
+                          }}
+                        >
+                          <div
+                            style={{
+                              fontWeight: 900,
+                              fontSize: 14,
+                              minWidth: 0,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            Page {it.pageNum ?? ""} • {it.label}
+                          </div>
 
-                      <div
-                        style={{
-                          fontWeight: 900,
-                          fontSize: 14,
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {Math.round(it.confPct)}%
+                          <div
+                            style={{
+                              fontWeight: 900,
+                              fontSize: 14,
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {Math.round(it.confPct)}%
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                    </div>
                     ))
                   ) : (
-                    <div style={{ fontSize: 13, opacity: 0.75 }}>No low-confidence paragraph/list/table blocks found.</div>
+                    <div style={{ fontSize: 13, opacity: 0.75 }}>
+                      No low-confidence paragraph/list/table blocks found.
+                    </div>
                   )}
                 </div>
               </div>
             ) : null}
           </div>
+
           {!user ? (
             <>
               <button
@@ -2779,20 +4007,30 @@ useEffect(() => {
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.transform = "translateY(1px)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.transform = "translateY(0px)")
+                }
               >
                 Community Leaderboard
               </button>
 
               <button
                 type="button"
-                onClick={() => setViewMode((m) => (m === "map" ? "viewer" : "map"))}
+                onClick={() =>
+                  setViewMode((m) => (m === "map" ? "viewer" : "map"))
+                }
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.transform = "translateY(1px)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.transform = "translateY(0px)")
+                }
               >
                 {viewMode === "map" ? "Back to Viewer" : "Map"}
               </button>
@@ -2803,10 +4041,16 @@ useEffect(() => {
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.transform = "translateY(1px)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.transform = "translateY(0px)")
+                }
               >
-                {collapseSuggestions ? "Show community suggestions" : "Hide community suggestions"}
+                {collapseSuggestions
+                  ? "Show community suggestions"
+                  : "Hide community suggestions"}
               </button>
 
               <button
@@ -2815,38 +4059,48 @@ useEffect(() => {
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.transform = "translateY(1px)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.transform = "translateY(0px)")
+                }
               >
                 Sign In
               </button>
             </>
           ) : (
             <>
-              <div style={{ fontSize: 13, opacity: 0.9 }}>
-                Signed in as <b>{usernameByUserId[user.id] || user.email || user.id}</b>
-              </div>
-
               <button
                 type="button"
                 onClick={openLeaderboard}
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.transform = "translateY(1px)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.transform = "translateY(0px)")
+                }
               >
                 Community Leaderboard
               </button>
 
               <button
                 type="button"
-                onClick={() => setViewMode((m) => (m === "map" ? "viewer" : "map"))}
+                onClick={() =>
+                  setViewMode((m) => (m === "map" ? "viewer" : "map"))
+                }
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.transform = "translateY(1px)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.transform = "translateY(0px)")
+                }
               >
                 {viewMode === "map" ? "Back to Viewer" : "Map"}
               </button>
@@ -2857,11 +4111,22 @@ useEffect(() => {
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.transform = "translateY(1px)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.transform = "translateY(0px)")
+                }
               >
-                {collapseSuggestions ? "Show community suggestions" : "Hide community suggestions"}
+                {collapseSuggestions
+                  ? "Show community suggestions"
+                  : "Hide community suggestions"}
               </button>
+
+              <div style={{ fontSize: 13, opacity: 0.9 }}>
+                Signed in as{" "}
+                <b>{usernameByUserId[user.id] || user.email || user.id}</b>
+              </div>
 
               <button
                 type="button"
@@ -2869,8 +4134,12 @@ useEffect(() => {
                 style={btnBase}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.transform = "translateY(1px)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.transform = "translateY(0px)")
+                }
               >
                 Sign Out
               </button>
@@ -2881,7 +4150,14 @@ useEffect(() => {
 
       {/* Main content (viewer or map) */}
       {viewMode === "map" ? (
-        <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
           <div
             style={{
               padding: 12,
@@ -2894,327 +4170,1124 @@ useEffect(() => {
               flexWrap: "wrap",
             }}
           >
-            <div style={{ fontWeight: 900, fontSize: 14, opacity: 0.85 }}>Document Map</div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ fontWeight: 900, fontSize: 14, opacity: 0.85 }}>
+                Document Map
+              </div>
+
+              <div
+                style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+              >
+                <div style={{ fontSize: 12, opacity: 0.75 }}>Document:</div>
+                <select
+                  value={selectedMapDocId}
+                  onChange={(e) => setSelectedMapDocId(e.target.value)}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 10,
+                    border: "1px solid rgba(0,0,0,0.12)",
+                    background: "white",
+                    fontSize: 12,
+                    fontWeight: 800,
+                    outline: "none",
+                    cursor: "pointer",
+                    minWidth: 240,
+                  }}
+                >
+                  <option value="__ALL__">All documents</option>
+                  {mapDocOptions.length ? (
+                    mapDocOptions.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.title}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">No documents</option>
+                  )}
+                </select>
+              </div>
+            </div>
           </div>
 
           {mapError ? (
-            <div style={{ padding: 12, color: "#b00020", fontFamily: "ui-sans-serif, system-ui" }}>
+            <div
+              style={{
+                padding: 12,
+                color: "#b00020",
+                fontFamily: "ui-sans-serif, system-ui",
+              }}
+            >
               {mapError}
             </div>
           ) : null}
 
           {isLoadingMap ? (
-            <div style={{ padding: 12, opacity: 0.75, fontFamily: "ui-sans-serif, system-ui" }}>Loading map…</div>
+            <div
+              style={{
+                padding: 12,
+                opacity: 0.75,
+                fontFamily: "ui-sans-serif, system-ui",
+              }}
+            >
+              Loading map…
+            </div>
           ) : null}
 
           <div
             ref={mapDivRef}
-            style={{
-              flex: 1,
-              minHeight: 0,
-              width: "100%",
-            }}
+            style={{ flex: 1, minHeight: 0, width: "100%" }}
           />
-
-          <div style={{ padding: 10, borderTop: "1px solid #e6e6e6", fontSize: 12, opacity: 0.8 }}>
-            {mapDocs.length
-              ? `Showing ${mapDocs.length.toLocaleString()} documents with locations.`
-              : "No document locations yet."}
+          <div
+            style={{
+              padding: 10,
+              borderTop: "1px solid #e6e6e6",
+              fontSize: 12,
+              opacity: 0.8,
+            }}
+          >
+            {selectedMapDocId
+              ? selectedMapDocId === "__ALL__"
+                ? mapAggLocations.length
+                  ? `Showing ${mapAggLocations.length.toLocaleString()} locations across all documents.`
+                  : "No locations have been tagged yet."
+                : mapLocations.length
+                  ? `Showing ${mapLocations.length.toLocaleString()} locations for this document.`
+                  : "No locations for this document yet."
+              : "No document selected."}
           </div>
         </div>
       ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", flex: 1, minHeight: 0 }}>
-      <div
-        style={{
-          borderRight: "1px solid #e6e6e6",
-          height: "100%",
-          display: "flex",
-          flexDirection: "column",
-          minWidth: 0,
-          minHeight: 0,
-        }}
-      >
-        {/* Header (does NOT scroll over the PDF) */}
         <div
           style={{
-            padding: 12,
-            borderBottom: "1px solid #e6e6e6",
-            background: "white",
-            zIndex: 1,
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            flex: 1,
+            minHeight: 0,
           }}
         >
           <div
             style={{
+              borderRight: "1px solid #e6e6e6",
+              height: "100%",
               display: "flex",
-              alignItems: "center",
-              gap: 12,
-              flexWrap: "wrap",
-              justifyContent: "space-between",
+              flexDirection: "column",
+              minWidth: 0,
+              minHeight: 0,
             }}
           >
-            {/* Controls (left) */}
-            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <select value={pageKey} onChange={(e) => setPageKey(e.target.value)}>
-                {pageKeys.map((k) => (
-                  <option key={k} value={k}>
-                    Page {pageKeyToNumber(k) ?? ""}
-                  </option>
-                ))}
-              </select>
-
-              <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-                <button type="button" onClick={zoomOut} style={{ padding: "4px 8px" }}>
-                  −
-                </button>
-                <button type="button" onClick={zoomReset} style={{ padding: "4px 8px" }}>
-                  {Math.round(zoom * 100)}%
-                </button>
-                <button type="button" onClick={zoomIn} style={{ padding: "4px 8px" }}>
-                  +
-                </button>
-              </span>
-            </div>
-
-            {/* Document title (right) */}
+            {/* Header (does NOT scroll over the PDF) */}
             <div
               style={{
-                fontWeight: 900,
-                fontSize: 15,
-                opacity: 0.9,
-                whiteSpace: "nowrap",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                maxWidth: "55%",
-                textAlign: "right",
+                position: "sticky",
+                top: 0,
+                height: 56,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                padding: "0 16px",
+                borderBottom: "1px solid #e6e6e6",
+                background: "white",
+                zIndex: 10000,
+                flex: "0 0 auto",
               }}
-              title={documentTitle ? documentTitle : "(Untitled document)"}
             >
-              {documentTitle ? documentTitle : "(Untitled document)"}
-            </div>
-          </div>
-
-        </div>
-
-        {/* Scrollable PDF area */}
-        <div
-          ref={pdfScrollRef}
-          onWheel={onPdfWheel}
-          onMouseDown={onPdfMouseDown}
-          onMouseMove={onPdfMouseMove}
-          onMouseUp={onPdfMouseUp}
-          onMouseLeave={onPdfMouseLeave}
-          style={{
-            padding: 12,
-            overflow: "auto",
-            flex: 1,
-            minHeight: 0,
-            cursor: zoom > 1 ? "grab" : "auto",
-          }}
-        >
-          <div style={{ position: "relative", display: "inline-block" }}>
-            <canvas ref={canvasRef} />
-
-            {/* Invisible hit layer (interactive) */}
-            <svg
-              ref={hitSvgRef}
-              viewBox="0 0 1 1"
-              preserveAspectRatio="none"
-              onMouseMove={onHitSvgMouseMove}
-              onMouseLeave={onHitSvgMouseLeave}
-              onClick={onHitSvgClick}
-              style={{ position: "absolute", left: 0, top: 0, width: "100%", height: "100%", pointerEvents: "auto" }}
-            />
-
-            {/* Visible highlight layer (non-interactive) */}
-            <svg
-              ref={highlightSvgRef}
-              viewBox="0 0 1 1"
-              preserveAspectRatio="none"
-              style={{ position: "absolute", left: 0, top: 0, width: "100%", height: "100%", pointerEvents: "none" }}
-            >
-              {activeBox ? (
-                <rect
-                  x={activeBox.x}
-                  y={activeBox.y}
-                  width={activeBox.w}
-                  height={activeBox.h}
-                  fill="none"
-                  stroke="rgba(255, 200, 0, 0.95)"
-                  strokeWidth={3}
-                  vectorEffect="non-scaling-stroke"
-                />
-              ) : null}
-            </svg>
-          </div>
-        </div>
-      </div>
-
-      <div ref={rightScrollRef} style={{ padding: 12, overflow: "auto", minHeight: 0 }}>
-        {/* Sticky transcription mode toggle */}
-        <div style={{ position: "sticky", top: 0, background: "white", paddingBottom: 10, zIndex: 2 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-            <div style={{ fontWeight: 900, fontSize: 14, opacity: 0.8 }}>Transcription Source</div>
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <button
-                type="button"
-                onClick={() => setAutoScrollEnabled((v) => !v)}
+              <div
                 style={{
-                  ...btnBase,
-                  padding: "6px 10px",
-                  fontSize: 12,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                  flexWrap: "nowrap",
+                  justifyContent: "space-between",
+                }}
+              >
+                {/* Controls (left) */}
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    flexWrap: "wrap",
+                    flex: 1,
+                    minWidth: 0,
+                  }}
+                >
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      gap: 4,
+                      alignItems: "center",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const idx = pageKeys.indexOf(pageKey);
+                        if (idx > 0) setPageKey(pageKeys[idx - 1]);
+                      }}
+                      disabled={pageKeys.indexOf(pageKey) <= 0}
+                      style={{
+                        padding: "4px 8px",
+                        fontSize: 16,
+                        lineHeight: 1,
+                        cursor:
+                          pageKeys.indexOf(pageKey) <= 0
+                            ? "not-allowed"
+                            : "pointer",
+                        opacity: pageKeys.indexOf(pageKey) <= 0 ? 0.35 : 1,
+                        border: "1px solid rgba(0,0,0,0.18)",
+                        borderRadius: 8,
+                        background: "white",
+                      }}
+                      title="Previous page"
+                    >
+                      ‹
+                    </button>
+                    <select
+                      value={pageKey}
+                      onChange={(e) => setPageKey(e.target.value)}
+                    >
+                      {pageKeys.map((k) => (
+                        <option key={k} value={k}>
+                          Page {pageKeyToNumber(k) ?? ""}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const idx = pageKeys.indexOf(pageKey);
+                        if (idx < pageKeys.length - 1)
+                          setPageKey(pageKeys[idx + 1]);
+                      }}
+                      disabled={
+                        pageKeys.indexOf(pageKey) >= pageKeys.length - 1
+                      }
+                      style={{
+                        padding: "4px 8px",
+                        fontSize: 16,
+                        lineHeight: 1,
+                        cursor:
+                          pageKeys.indexOf(pageKey) >= pageKeys.length - 1
+                            ? "not-allowed"
+                            : "pointer",
+                        opacity:
+                          pageKeys.indexOf(pageKey) >= pageKeys.length - 1
+                            ? 0.35
+                            : 1,
+                        border: "1px solid rgba(0,0,0,0.18)",
+                        borderRadius: 8,
+                        background: "white",
+                      }}
+                      title="Next page"
+                    >
+                      ›
+                    </button>
+                  </span>
+
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      gap: 8,
+                      alignItems: "center",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={zoomOut}
+                      style={{ padding: "4px 8px" }}
+                    >
+                      −
+                    </button>
+                    <button
+                      type="button"
+                      onClick={zoomReset}
+                      style={{ padding: "4px 8px" }}
+                    >
+                      {Math.round(zoom * 100)}%
+                    </button>
+                    <button
+                      type="button"
+                      onClick={zoomIn}
+                      style={{ padding: "4px 8px" }}
+                    >
+                      +
+                    </button>
+                  </span>
+
+                  {(() => {
+                    const hasTranscription = !!(
+                      doc &&
+                      pageKey &&
+                      (doc as any)[pageKey]
+                    );
+                    if (!hasTranscription) return null;
+                    const seq = pageKeyToNumber(pageKey);
+                    const existing = seq
+                      ? viewerLocations.find((x) => x.seq === seq)
+                      : null;
+                    const hasExisting = !!existing;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!user)
+                            return alert("Please sign in to add locations.");
+                          const seq2 = pageKeyToNumber(pageKey);
+                          if (!seq2)
+                            return alert(
+                              "Could not determine page number for this page.",
+                            );
+                          const ex =
+                            viewerLocations.find((x) => x.seq === seq2) || null;
+                          if (ex) {
+                            setLocLabel((ex.label ?? "").toString());
+                            setLocLat(
+                              Number.isFinite(Number(ex.lat))
+                                ? String(ex.lat)
+                                : "",
+                            );
+                            setLocLng(
+                              Number.isFinite(Number(ex.lng))
+                                ? String(ex.lng)
+                                : "",
+                            );
+                            setLocNote((ex.note ?? "").toString());
+                          } else {
+                            setLocLabel("");
+                            setLocLat("");
+                            setLocLng("");
+                            setLocNote("");
+                          }
+                          setShowAddLocation(true);
+                        }}
+                        style={{
+                          padding: "6px 10px",
+                          borderRadius: 10,
+                          border: "1px solid rgba(0,0,0,0.18)",
+                          background: "white",
+                          cursor: "pointer",
+                          fontWeight: 800,
+                          boxShadow: "0 1px 2px rgba(0,0,0,0.10)",
+                          whiteSpace: "nowrap",
+                        }}
+                        title={
+                          hasExisting
+                            ? "Change the map location for this page"
+                            : "Add a map location for this page"
+                        }
+                      >
+                        {hasExisting ? "Change location" : "Add location"}
+                      </button>
+                    );
+                  })()}
+
+                  {(() => {
+                    const seq = pageKeyToNumber(pageKey);
+                    if (!seq) return null;
+                    const loc = viewerLocations.find((x) => x.seq === seq);
+                    if (!loc) return null;
+                    const label = (loc.label ?? "").trim();
+                    const lat = Number(loc.lat);
+                    const lng = Number(loc.lng);
+                    const coordsOk =
+                      Number.isFinite(lat) && Number.isFinite(lng);
+                    return (
+                      <div
+                        title={
+                          coordsOk
+                            ? `Location${label ? `: ${label}` : ""} (${lat.toFixed(5)}, ${lng.toFixed(5)})`
+                            : label
+                              ? `Location: ${label}`
+                              : "Location"
+                        }
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "6px 10px",
+                          borderRadius: 999,
+                          border: "1px solid rgba(0,0,0,0.12)",
+                          background: "rgba(0,0,0,0.03)",
+                          fontSize: 12,
+                          fontWeight: 900,
+                          opacity: 0.9,
+                          maxWidth: 360,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        <span aria-hidden="true">📍</span>
+                        <span
+                          style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {label ? label : ""}
+                          {coordsOk
+                            ? label
+                              ? ` • ${lat.toFixed(5)}, ${lng.toFixed(5)}`
+                              : `${lat.toFixed(5)}, ${lng.toFixed(5)}`
+                            : ""}
+                        </span>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+
+              {/* Absolutely-positioned document title at far-right of the left column header */}
+              <div
+                style={{
+                  position: "absolute",
+                  right: 16,
+                  top: "50%",
+                  transform: "translateY(-50%)",
                   fontWeight: 900,
-                  border: "1px solid rgba(0,0,0,0.14)",
-                  background: autoScrollEnabled ? "white" : "rgba(0,0,0,0.05)",
-                  opacity: autoScrollEnabled ? 1 : 0.85,
+                  fontSize: 15,
+                  opacity: 0.9,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  maxWidth: "45%",
+                  textAlign: "right",
                 }}
-                onMouseDown={preventMouseDownFocus}
-                onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
-                aria-pressed={autoScrollEnabled}
-                title="Toggle auto-scrolling of the right panel when hovering the PDF"
+                title={documentTitle ? documentTitle : "(Untitled document)"}
               >
-                Auto-scroll: {autoScrollEnabled ? "On" : "Off"}
-              </button>
-              <button
-                type="button"
-                onClick={() => setTranscriptionMode("lines")}
-                aria-pressed={transcriptionMode === "lines"}
-                style={{
-                  ...btnBase,
-                  ...(transcriptionMode === "lines"
-                    ? { border: "1px solid rgba(0,0,0,0.22)", background: "white", fontWeight: 900 }
-                    : { border: "1px solid rgba(0,0,0,0.14)", background: "white", fontWeight: 800, opacity: 0.85 }),
-                }}
-                onMouseDown={(e) => {
-                  // prevent the "stuck selected" look from focus rings
-                  e.preventDefault();
-                  (e.currentTarget as HTMLButtonElement).blur();
-                }}
-                onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
-              >
-                By Line
-              </button>
-              <button
-                type="button"
-                onClick={() => setTranscriptionMode("paragraph")}
-                aria-pressed={transcriptionMode === "paragraph"}
-                style={{
-                  ...btnBase,
-                  ...(transcriptionMode === "paragraph"
-                    ? { border: "1px solid rgba(0,0,0,0.22)", background: "white", fontWeight: 900 }
-                    : { border: "1px solid rgba(0,0,0,0.14)", background: "white", fontWeight: 800, opacity: 0.85 }),
-                }}
-                onMouseDown={(e) => {
-                  // prevent the "stuck selected" look from focus rings
-                  e.preventDefault();
-                  (e.currentTarget as HTMLButtonElement).blur();
-                }}
-                onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
-              >
-                By Paragraph
-              </button>
+                {documentTitle ? documentTitle : "(Untitled document)"}
+              </div>
+            </div>
+
+            {/* Scrollable PDF area */}
+            <div
+              ref={pdfScrollRef}
+              onWheel={onPdfWheel}
+              onMouseDown={onPdfMouseDown}
+              onMouseMove={onPdfMouseMove}
+              onMouseUp={onPdfMouseUp}
+              onMouseLeave={onPdfMouseLeave}
+              style={{
+                padding: 12,
+                overflow: "auto",
+                flex: 1,
+                minHeight: 0,
+                cursor: zoom > 1 ? "grab" : "auto",
+              }}
+            >
+              <div style={{ position: "relative", display: "inline-block" }}>
+                <canvas ref={canvasRef} />
+
+                {/* Invisible hit layer (interactive) */}
+                <svg
+                  ref={hitSvgRef}
+                  viewBox="0 0 1 1"
+                  preserveAspectRatio="none"
+                  onMouseMove={onHitSvgMouseMove}
+                  onMouseLeave={onHitSvgMouseLeave}
+                  onMouseDown={onHitSvgMouseDown}
+                  onMouseUp={onHitSvgMouseUp}
+                  onClick={onHitSvgClick}
+                  style={{
+                    position: "absolute",
+                    left: 0,
+                    top: 0,
+                    width: "100%",
+                    height: "100%",
+                    pointerEvents: "auto",
+                    cursor: isDrawingLowConfBox ? "crosshair" : "default",
+                  }}
+                />
+
+                {/* Visible highlight layer (non-interactive) */}
+                <svg
+                  ref={highlightSvgRef}
+                  viewBox="0 0 1 1"
+                  preserveAspectRatio="none"
+                  style={{
+                    position: "absolute",
+                    left: 0,
+                    top: 0,
+                    width: "100%",
+                    height: "100%",
+                    pointerEvents: "none",
+                  }}
+                >
+                  {/* Active hover/selection highlight */}
+                  {activeBox ? (
+                    <rect
+                      x={activeBox.x}
+                      y={activeBox.y}
+                      width={activeBox.w}
+                      height={activeBox.h}
+                      fill="none"
+                      stroke="rgba(255, 200, 0, 0.95)"
+                      strokeWidth={3}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ) : null}
+
+                  {/* While drawing: live preview box */}
+                  {drawPreviewBox ? (
+                    <rect
+                      x={drawPreviewBox.x}
+                      y={drawPreviewBox.y}
+                      width={drawPreviewBox.w}
+                      height={drawPreviewBox.h}
+                      fill="rgba(40, 80, 255, 0.06)"
+                      stroke="rgba(40, 80, 255, 0.95)"
+                      strokeWidth={3}
+                      strokeDasharray="8 6"
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ) : null}
+
+                  {/* While locked OR in drawing mode (not dragging): show hovered block bbox without changing right-panel selection */}
+                  {(lowConfLockKey || isDrawingLowConfBox) &&
+                  !drawPreviewBox &&
+                  drawHoverBox ? (
+                    <rect
+                      x={drawHoverBox.x}
+                      y={drawHoverBox.y}
+                      width={drawHoverBox.w}
+                      height={drawHoverBox.h}
+                      fill="rgba(0,0,0,0)"
+                      stroke="rgba(255, 200, 0, 0.95)"
+                      strokeWidth={3}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ) : null}
+
+                  {/* Saved user-drawn box for the currently active low-confidence block */}
+                  {pageKey &&
+                  activeParagraphId &&
+                  lowConfByPid[String(activeParagraphId)]
+                    ? (() => {
+                        const k = `${pageKey}|${String(activeParagraphId)}`;
+                        const b = lowConfDrawnBoxByKey[k];
+                        if (!b) return null;
+                        return (
+                          <rect
+                            x={b.x}
+                            y={b.y}
+                            width={b.w}
+                            height={b.h}
+                            fill="rgba(40, 80, 255, 0.06)"
+                            stroke="rgba(40, 80, 255, 0.95)"
+                            strokeWidth={3}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        );
+                      })()
+                    : null}
+                </svg>
+              </div>
             </div>
           </div>
-        </div>
 
-        {transcriptionMode === "paragraph" ? (
-          paragraphItems.length ? (
-            <div style={{ display: "grid", gap: 10, fontSize: 16 }}>
-              {paragraphItems.map((p) => {
-                const isActive = activeParagraphId === p.pid;
-                const lowMeta = lowConfByPid[p.pid];
-                const isLowConf = !!lowMeta;
-                const lowKey = `${pageKey}|${p.pid}`;
+          <div
+            ref={rightScrollRef}
+            style={{
+              padding: 12,
+              overflow: isLowConfLocked ? "hidden" : "auto",
+              minHeight: 0,
+            }}
+          >
+            {/* Sticky transcription mode toggle */}
+            <div
+              style={{
+                position: "sticky",
+                top: 0,
+                background: "white",
+                paddingBottom: 10,
+                zIndex: 2,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                }}
+              >
+                <div style={{ fontWeight: 900, fontSize: 14, opacity: 0.8 }}>
+                  Transcription Source
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <button
+                    type="button"
+                    onClick={() => setAutoScrollEnabled((v) => !v)}
+                    style={{
+                      ...btnBase,
+                      padding: "6px 10px",
+                      fontSize: 12,
+                      fontWeight: 900,
+                      border: "1px solid rgba(0,0,0,0.14)",
+                      background: autoScrollEnabled
+                        ? "white"
+                        : "rgba(0,0,0,0.05)",
+                      opacity: autoScrollEnabled ? 1 : 0.85,
+                    }}
+                    onMouseDown={preventMouseDownFocus}
+                    onFocus={blurOnFocus}
+                    onMouseEnter={(e) =>
+                      (e.currentTarget.style.transform = "translateY(1px)")
+                    }
+                    onMouseLeave={(e) =>
+                      (e.currentTarget.style.transform = "translateY(0px)")
+                    }
+                    aria-pressed={autoScrollEnabled}
+                    title="Toggle auto-scrolling of the right panel when hovering the PDF"
+                  >
+                    Auto-Scroll: {autoScrollEnabled ? "On" : "Off"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTranscriptionMode("lines")}
+                    aria-pressed={transcriptionMode === "lines"}
+                    style={{
+                      ...btnBase,
+                      ...(transcriptionMode === "lines"
+                        ? {
+                            border: "1px solid rgba(0,0,0,0.22)",
+                            background: "white",
+                            fontWeight: 900,
+                          }
+                        : {
+                            border: "1px solid rgba(0,0,0,0.14)",
+                            background: "white",
+                            fontWeight: 800,
+                            opacity: 0.85,
+                          }),
+                    }}
+                    onMouseDown={(e) => {
+                      // prevent the "stuck selected" look from focus rings
+                      e.preventDefault();
+                      (e.currentTarget as HTMLButtonElement).blur();
+                    }}
+                    onFocus={blurOnFocus}
+                    onMouseEnter={(e) =>
+                      (e.currentTarget.style.transform = "translateY(1px)")
+                    }
+                    onMouseLeave={(e) =>
+                      (e.currentTarget.style.transform = "translateY(0px)")
+                    }
+                  >
+                    By Line
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTranscriptionMode("paragraph")}
+                    aria-pressed={transcriptionMode === "paragraph"}
+                    style={{
+                      ...btnBase,
+                      ...(transcriptionMode === "paragraph"
+                        ? {
+                            border: "1px solid rgba(0,0,0,0.22)",
+                            background: "white",
+                            fontWeight: 900,
+                          }
+                        : {
+                            border: "1px solid rgba(0,0,0,0.14)",
+                            background: "white",
+                            fontWeight: 800,
+                            opacity: 0.85,
+                          }),
+                    }}
+                    onMouseDown={(e) => {
+                      // prevent the "stuck selected" look from focus rings
+                      e.preventDefault();
+                      (e.currentTarget as HTMLButtonElement).blur();
+                    }}
+                    onFocus={blurOnFocus}
+                    onMouseEnter={(e) =>
+                      (e.currentTarget.style.transform = "translateY(1px)")
+                    }
+                    onMouseLeave={(e) =>
+                      (e.currentTarget.style.transform = "translateY(0px)")
+                    }
+                  >
+                    By Paragraph
+                  </button>
+                </div>
+              </div>
+            </div>
 
-                const saved = lowConfLabelsByKey[lowKey];
-                const draft = lowConfDraftByKey[lowKey] || {
-                  corrected_class: saved?.corrected_class || "Paragraph",
-                  other_text: saved?.other_text || "",
-                };
-                return (
+            {transcriptionMode === "paragraph" ? (
+              paragraphItems.length ? (
+                <div
+                  style={{
+                    position: "relative",
+                    display: "grid",
+                    gap: 10,
+                    fontSize: 16,
+                  }}
+                >
+                  {isLowConfLocked ? (
+                    <div
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        zIndex: 1,
+                        cursor: "not-allowed",
+                      }}
+                    />
+                  ) : null}
+                  {paragraphItems.map((p) => {
+                    const isActive = activeParagraphId === p.pid;
+                    const lowMeta = lowConfByPid[p.pid];
+                    const isLowConf = !!lowMeta;
+                    const lowKey = `${pageKey}|${p.pid}`;
+
+                    const saved = lowConfLabelsByKey[lowKey];
+                    const draft = lowConfDraftByKey[lowKey] || {
+                      corrected_class: saved?.corrected_class || "Paragraph",
+                      other_text: saved?.other_text || "",
+                    };
+
+                    const isThisLocked = lowConfLockKey === lowKey;
+
+                    return (
+                      <div
+                        key={p.pid}
+                        ref={(el) => {
+                          paragraphElByIdRef.current[String(p.pid)] = el;
+                        }}
+                        onMouseEnter={() => {
+                          if (isDrawingLowConfBox) return;
+                          setActiveSource("right");
+                          setActiveParagraphId(p.pid);
+                          setActiveId(null);
+                          setActiveBox(p.box);
+                        }}
+                        onMouseLeave={() => {
+                          if (isDrawingLowConfBox) return;
+                          setActiveSource(null);
+                          setActiveParagraphId(null);
+                          setActiveBox(null);
+                        }}
+                        onClick={() => {
+                          if (isDrawingLowConfBox) return;
+                          setActiveSource("right");
+                          setActiveParagraphId(p.pid);
+                          setActiveId(null);
+                          setActiveBox(p.box);
+                        }}
+                        style={{
+                          padding: "10px 6px",
+                          borderRadius: 10,
+                          lineHeight: 1.35,
+                          cursor: "pointer",
+                          border: "1px solid rgba(0,0,0,0.06)",
+                          background: isActive
+                            ? "rgba(255,242,168,0.75)"
+                            : isLowConf
+                              ? "rgba(255,242,168,0.28)"
+                              : "transparent",
+                          boxShadow: "none",
+                          fontFamily: "Georgia, 'Times New Roman', serif",
+                          fontSize: 15,
+                          position: "relative",
+                          zIndex: isThisLocked ? 2 : "auto",
+                        }}
+                      >
+                        {/* Always-visible low-confidence badge */}
+                        {isLowConf ? (
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: 10,
+                              marginBottom: 6,
+                              padding: "6px 10px",
+                              borderRadius: 12,
+                              border: "1px solid rgba(255, 200, 0, 0.35)",
+                              background: "rgba(255, 242, 168, 0.22)",
+                              fontFamily: "ui-sans-serif, system-ui",
+                            }}
+                          >
+                            <div
+                              style={{
+                                fontSize: 12,
+                                fontWeight: 900,
+                                color: "rgba(120,80,0,0.92)",
+                              }}
+                            >
+                              Low confidence •{" "}
+                              {Math.round(lowMeta?.confPct ?? 0)}%
+                            </div>
+                            <div
+                              style={{
+                                fontSize: 12,
+                                opacity: 0.7,
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {lowMeta?.predicted_class
+                                ? String(lowMeta.predicted_class)
+                                : ""}
+                            </div>
+                          </div>
+                        ) : null}
+
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 10,
+                            alignItems: "center",
+                          }}
+                        >
+                          <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>
+                            {p.text}
+                          </div>
+                          <button
+                            type="button"
+                            aria-label="Suggest edit"
+                            title="Suggest edit"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (openSuggestUid === p.pid) {
+                                setOpenSuggestUid(null);
+                                setSuggestText("");
+                                setSuggestComment("");
+                              } else {
+                                setOpenSuggestUid(p.pid);
+                                setSuggestText(p.text);
+                                setSuggestComment("");
+                              }
+                            }}
+                            style={iconBtn}
+                            onMouseDown={preventMouseDownFocus}
+                            onFocus={blurOnFocus}
+                            onMouseEnter={(e) => {
+                              (
+                                e.currentTarget as HTMLButtonElement
+                              ).style.background = "rgba(0,0,0,0.06)";
+                              (
+                                e.currentTarget as HTMLButtonElement
+                              ).style.transform = "translateY(1px)";
+                            }}
+                            onMouseLeave={(e) => {
+                              (
+                                e.currentTarget as HTMLButtonElement
+                              ).style.background = "transparent";
+                              (
+                                e.currentTarget as HTMLButtonElement
+                              ).style.transform = "translateY(0px)";
+                            }}
+                          >
+                            <PencilGlyph size={16} />
+                          </button>
+                        </div>
+
+                        {/* Low-confidence dropdown editor: only show when active AND low confidence */}
+                        {(isActive || isThisLocked) && isLowConf ? (
+                          <div
+                            style={{
+                              marginTop: 10,
+                              padding: 10,
+                              borderRadius: 12,
+                              border: "1px solid rgba(255, 200, 0, 0.45)",
+                              background: "rgba(255, 242, 168, 0.25)",
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 10,
+                              }}
+                            >
+                              <div style={{ fontWeight: 900, fontSize: 13 }}>
+                                Low confidence • {Math.round(lowMeta.confPct)}%
+                              </div>
+                              {saved?.updated_at ? (
+                                <div
+                                  style={{
+                                    fontSize: 12,
+                                    opacity: 0.65,
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  saved
+                                </div>
+                              ) : null}
+                            </div>
+
+                            <div
+                              style={{
+                                display: "flex",
+                                gap: 10,
+                                alignItems: "center",
+                                marginTop: 10,
+                                flexWrap: "wrap",
+                              }}
+                            >
+                              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                                This is actually:
+                              </div>
+
+                              <select
+                                value={draft.corrected_class}
+                                onChange={(e) => {
+                                  const v = e.target.value as any;
+                                  setLowConfDraftByKey((prev) => ({
+                                    ...prev,
+                                    [lowKey]: {
+                                      corrected_class: v,
+                                      other_text:
+                                        v === "Other"
+                                          ? draft.other_text || ""
+                                          : "",
+                                    },
+                                  }));
+                                }}
+                                style={{
+                                  padding: "6px 10px",
+                                  borderRadius: 10,
+                                  border: "1px solid rgba(0,0,0,0.15)",
+                                  background: "white",
+                                  fontWeight: 800,
+                                  fontSize: 12,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                <option value="Paragraph">Paragraph</option>
+                                <option value="List">List</option>
+                                <option value="Table">Table</option>
+                                <option value="Other">Other</option>
+                              </select>
+
+                              {draft.corrected_class === "Other" ? (
+                                <input
+                                  value={draft.other_text}
+                                  onChange={(e) => {
+                                    const v = e.target.value;
+                                    setLowConfDraftByKey((prev) => ({
+                                      ...prev,
+                                      [lowKey]: {
+                                        corrected_class: "Other",
+                                        other_text: v,
+                                      },
+                                    }));
+                                  }}
+                                  placeholder="What is it?"
+                                  style={{
+                                    flex: "1 1 220px",
+                                    minWidth: 180,
+                                    padding: "6px 10px",
+                                    borderRadius: 10,
+                                    border: "1px solid rgba(0,0,0,0.15)",
+                                  }}
+                                />
+                              ) : null}
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsDrawingLowConfBox((v) => {
+                                    const next = !v;
+                                    if (next) {
+                                      // turning on — lock immediately so Cancel appears right away
+                                      beginLowConfLock(lowKey);
+                                      drawStartRef.current = null;
+                                      setDrawPreviewBox(null);
+                                      setDrawHoverBox(null);
+                                    } else {
+                                      // turning off
+                                      drawStartRef.current = null;
+                                      setDrawPreviewBox(null);
+                                      setDrawHoverBox(null);
+                                    }
+                                    return next;
+                                  });
+                                }}
+                                style={{
+                                  padding: "6px 10px",
+                                  fontSize: 12,
+                                  borderRadius: 10,
+                                  border: "1px solid rgba(0,0,0,0.18)",
+                                  background: isDrawingLowConfBox
+                                    ? "rgba(40, 80, 255, 0.10)"
+                                    : "white",
+                                  cursor: "pointer",
+                                  fontWeight: 900,
+                                  whiteSpace: "nowrap",
+                                }}
+                                title="Draw a corrected bounding box on the left PDF by click-dragging"
+                              >
+                                {isDrawingLowConfBox
+                                  ? "Drawing… (drag on PDF)"
+                                  : "Draw box"}
+                              </button>
+
+                              <button
+                                type="button"
+                                disabled={!user || !!isSavingLowConf[lowKey]}
+                                onClick={async () => {
+                                  if (!user)
+                                    return alert(
+                                      "Please sign in to save labels.",
+                                    );
+
+                                  setIsSavingLowConf((prev) => ({
+                                    ...prev,
+                                    [lowKey]: true,
+                                  }));
+                                  try {
+                                    await saveLowConfLabel({
+                                      page_key: pageKey,
+                                      target_pid: p.pid,
+                                      predicted_class: lowMeta.predicted_class,
+                                      predicted_confidence:
+                                        lowMeta.predicted_confidence,
+                                      corrected_class: draft.corrected_class,
+                                      other_text: draft.other_text || "",
+                                    });
+
+                                    // ✅ unlock after save (only if this block is the one locked)
+                                    if (lowConfLockKey === lowKey) {
+                                      clearLowConfLock();
+                                    }
+                                  } finally {
+                                    setIsSavingLowConf((prev) => ({
+                                      ...prev,
+                                      [lowKey]: false,
+                                    }));
+                                  }
+                                }}
+                                style={{
+                                  padding: "6px 10px",
+                                  fontSize: 12,
+                                  borderRadius: 10,
+                                  border: "1px solid rgba(0,0,0,0.18)",
+                                  background: !user
+                                    ? "rgba(0,0,0,0.06)"
+                                    : "white",
+                                  cursor: !user ? "not-allowed" : "pointer",
+                                  fontWeight: 900,
+                                  opacity: !user ? 0.65 : 1,
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                {isSavingLowConf[lowKey] ? "Saving…" : "Save"}
+                              </button>
+
+                              {/* ✅ cancel only shows when locked on THIS block */}
+                              {isThisLocked ? (
+                                <button
+                                  type="button"
+                                  onClick={() => cancelLowConfLock(lowKey)}
+                                  style={{
+                                    padding: "6px 10px",
+                                    fontSize: 12,
+                                    borderRadius: 10,
+                                    border: "1px solid rgba(0,0,0,0.18)",
+                                    background: "white",
+                                    cursor: "pointer",
+                                    fontWeight: 900,
+                                    whiteSpace: "nowrap",
+                                  }}
+                                  title="Cancel drawing and restore the previous box"
+                                >
+                                  Cancel
+                                </button>
+                              ) : null}
+
+                              {!user ? (
+                                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                                  Sign in to save.
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {/* (rest of your file continues unchanged) */}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ opacity: 0.75, fontSize: 15 }}>
+                  No paragraph transcription available for this page.
+                </div>
+              )
+            ) : (
+              <div style={{ fontSize: 16 }}>
+                {lines.map((l) => (
                   <div
-                    key={p.pid}
+                    key={l.uid}
                     ref={(el) => {
-                      paragraphElByIdRef.current[String(p.pid)] = el;
+                      lineElByIdRef.current[String(l.uid)] = el;
                     }}
                     onMouseEnter={() => {
+                      if (lowConfLockKey || isDrawingLowConfBox) return;
                       setActiveSource("right");
-                      setActiveParagraphId(p.pid);
-                      setActiveId(null);
-                      setActiveBox(p.box);
+                      setActiveId(l.uid);
+                      setActiveParagraphId(null);
+                      setActiveBox(boxByUidRef.current[l.uid] ?? null);
                     }}
                     onMouseLeave={() => {
+                      if (lowConfLockKey || isDrawingLowConfBox) return;
                       setActiveSource(null);
-                      setActiveParagraphId(null);
+                      setActiveId(null);
                       setActiveBox(null);
                     }}
                     onClick={() => {
+                      if (lowConfLockKey || isDrawingLowConfBox) return;
                       setActiveSource("right");
-                      setActiveParagraphId(p.pid);
-                      setActiveId(null);
-                      setActiveBox(p.box);
+                      setActiveId(l.uid);
+                      setActiveParagraphId(null);
+                      setActiveBox(boxByUidRef.current[l.uid] ?? null);
                     }}
                     style={{
                       padding: "10px 6px",
                       borderRadius: 10,
-                      lineHeight: 1.35,
+                      lineHeight: 1.3,
+                      fontSize: 15,
                       cursor: "pointer",
                       border: "1px solid rgba(0,0,0,0.06)",
-                      background: isActive
-                        ? "rgba(255,242,168,0.75)"
-                        : isLowConf
-                        ? "rgba(255,242,168,0.28)"
-                        : "transparent",
+                      background:
+                        activeId === l.uid
+                          ? "rgba(255,242,168,0.75)"
+                          : "transparent",
                       boxShadow: "none",
                       fontFamily: "Georgia, 'Times New Roman', serif",
-                      fontSize: 15,
                     }}
                   >
-                    {/* Always-visible low-confidence badge */}
-                    {isLowConf ? (
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          gap: 10,
-                          marginBottom: 6,
-                          padding: "6px 10px",
-                          borderRadius: 12,
-                          border: "1px solid rgba(255, 200, 0, 0.35)",
-                          background: "rgba(255, 242, 168, 0.22)",
-                          fontFamily: "ui-sans-serif, system-ui",
-                        }}
-                      >
-                        <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(120,80,0,0.92)" }}>
-                          Low confidence • {Math.round((lowMeta?.confPct ?? 0))}%
-                        </div>
-                        <div style={{ fontSize: 12, opacity: 0.7, whiteSpace: "nowrap" }}>
-                          {lowMeta?.predicted_class ? String(lowMeta.predicted_class) : ""}
-                        </div>
+                    <div
+                      style={{ display: "flex", gap: 10, alignItems: "center" }}
+                    >
+                      <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>
+                        {l.transcription}
                       </div>
-                    ) : null}
-
-                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                      <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>{p.text}</div>
                       <button
                         type="button"
                         aria-label="Suggest edit"
                         title="Suggest edit"
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (openSuggestUid === p.pid) {
+                          if (openSuggestUid === l.uid) {
                             setOpenSuggestUid(null);
                             setSuggestText("");
                             setSuggestComment("");
                           } else {
-                            setOpenSuggestUid(p.pid);
-                            setSuggestText(p.text);
+                            setOpenSuggestUid(l.uid);
+                            setSuggestText(l.transcription);
                             setSuggestComment("");
                           }
                         }}
@@ -3222,138 +5295,41 @@ useEffect(() => {
                         onMouseDown={preventMouseDownFocus}
                         onFocus={blurOnFocus}
                         onMouseEnter={(e) => {
-                          (e.currentTarget as HTMLButtonElement).style.background = "rgba(0,0,0,0.06)";
-                          (e.currentTarget as HTMLButtonElement).style.transform = "translateY(1px)";
+                          (
+                            e.currentTarget as HTMLButtonElement
+                          ).style.background = "rgba(0,0,0,0.06)";
+                          (
+                            e.currentTarget as HTMLButtonElement
+                          ).style.transform = "translateY(1px)";
                         }}
                         onMouseLeave={(e) => {
-                          (e.currentTarget as HTMLButtonElement).style.background = "transparent";
-                          (e.currentTarget as HTMLButtonElement).style.transform = "translateY(0px)";
+                          (
+                            e.currentTarget as HTMLButtonElement
+                          ).style.background = "transparent";
+                          (
+                            e.currentTarget as HTMLButtonElement
+                          ).style.transform = "translateY(0px)";
                         }}
                       >
                         <PencilGlyph size={16} />
                       </button>
                     </div>
 
-                    {/* Low-confidence dropdown editor: only show when active AND low confidence */}
-                    {isActive && isLowConf ? (
+                    {openSuggestUid === l.uid ? (
                       <div
-                        style={{
-                          marginTop: 10,
-                          padding: 10,
-                          borderRadius: 12,
-                          border: "1px solid rgba(255, 200, 0, 0.45)",
-                          background: "rgba(255, 242, 168, 0.25)",
-                        }}
+                        style={{ marginTop: 8 }}
                         onClick={(e) => e.stopPropagation()}
                       >
-                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-                          <div style={{ fontWeight: 900, fontSize: 13 }}>
-                            Low confidence • {Math.round(lowMeta.confPct)}%
-                          </div>
-                          {saved?.updated_at ? (
-                            <div style={{ fontSize: 12, opacity: 0.65, whiteSpace: "nowrap" }}>saved</div>
-                          ) : null}
-                        </div>
-
-                        <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 10, flexWrap: "wrap" }}>
-                          <div style={{ fontSize: 12, opacity: 0.75 }}>This is actually:</div>
-
-                          <select
-                            value={draft.corrected_class}
-                            onChange={(e) => {
-                              const v = e.target.value as any;
-                              setLowConfDraftByKey((prev) => ({
-                                ...prev,
-                                [lowKey]: {
-                                  corrected_class: v,
-                                  other_text: v === "Other" ? (draft.other_text || "") : "",
-                                },
-                              }));
-                            }}
-                            style={{
-                              padding: "6px 10px",
-                              borderRadius: 10,
-                              border: "1px solid rgba(0,0,0,0.15)",
-                              background: "white",
-                              fontWeight: 800,
-                              fontSize: 12,
-                              cursor: "pointer",
-                            }}
-                          >
-                            <option value="Paragraph">Paragraph</option>
-                            <option value="List">List</option>
-                            <option value="Table">Table</option>
-                            <option value="Other">Other</option>
-                          </select>
-
-                          {draft.corrected_class === "Other" ? (
-                            <input
-                              value={draft.other_text}
-                              onChange={(e) => {
-                                const v = e.target.value;
-                                setLowConfDraftByKey((prev) => ({
-                                  ...prev,
-                                  [lowKey]: { corrected_class: "Other", other_text: v },
-                                }));
-                              }}
-                              placeholder="What is it?"
-                              style={{
-                                flex: "1 1 220px",
-                                minWidth: 180,
-                                padding: "6px 10px",
-                                borderRadius: 10,
-                                border: "1px solid rgba(0,0,0,0.15)",
-                              }}
-                            />
-                          ) : null}
-
-                          <button
-                            type="button"
-                            disabled={!user || !!isSavingLowConf[lowKey]}
-                            onClick={async () => {
-                              if (!user) return alert("Please sign in to save labels.");
-
-                              setIsSavingLowConf((prev) => ({ ...prev, [lowKey]: true }));
-                              try {
-                                await saveLowConfLabel({
-                                  page_key: pageKey,
-                                  target_pid: p.pid,
-                                  predicted_class: lowMeta.predicted_class,
-                                  predicted_confidence: lowMeta.predicted_confidence,
-                                  corrected_class: draft.corrected_class,
-                                  other_text: draft.other_text || "",
-                                });
-                              } finally {
-                                setIsSavingLowConf((prev) => ({ ...prev, [lowKey]: false }));
-                              }
-                            }}
-                            style={{
-                              padding: "6px 10px",
-                              fontSize: 12,
-                              borderRadius: 10,
-                              border: "1px solid rgba(0,0,0,0.18)",
-                              background: !user ? "rgba(0,0,0,0.06)" : "white",
-                              cursor: !user ? "not-allowed" : "pointer",
-                              fontWeight: 900,
-                              opacity: !user ? 0.65 : 1,
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {isSavingLowConf[lowKey] ? "Saving…" : "Save"}
-                          </button>
-
-                          {!user ? <div style={{ fontSize: 12, opacity: 0.7 }}>Sign in to save.</div> : null}
-                        </div>
-                      </div>
-                    ) : null}
-
-                    {openSuggestUid === p.pid ? (
-                      <div style={{ marginTop: 10 }} onClick={(e) => e.stopPropagation()}>
                         <textarea
                           value={suggestText}
                           onChange={(e) => setSuggestText(e.target.value)}
-                          rows={4}
-                          style={{ width: "100%", padding: 8, borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)" }}
+                          rows={3}
+                          style={{
+                            width: "100%",
+                            padding: 8,
+                            borderRadius: 10,
+                            border: "1px solid rgba(0,0,0,0.15)",
+                          }}
                         />
                         <textarea
                           value={suggestComment}
@@ -3368,15 +5344,30 @@ useEffect(() => {
                             marginTop: 8,
                           }}
                         />
-                        <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 10,
+                            marginTop: 10,
+                            alignItems: "center",
+                          }}
+                        >
                           <button
                             type="button"
-                            onClick={() => submitSuggestion(p.pid, p.text)}
+                            onClick={() =>
+                              submitSuggestion(l.uid, l.transcription)
+                            }
                             style={btnBase}
                             onMouseDown={preventMouseDownFocus}
                             onFocus={blurOnFocus}
-                            onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                            onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                            onMouseEnter={(e) =>
+                              (e.currentTarget.style.transform =
+                                "translateY(1px)")
+                            }
+                            onMouseLeave={(e) =>
+                              (e.currentTarget.style.transform =
+                                "translateY(0px)")
+                            }
                           >
                             Submit
                           </button>
@@ -3391,21 +5382,46 @@ useEffect(() => {
                             style={btnBase}
                             onMouseDown={preventMouseDownFocus}
                             onFocus={blurOnFocus}
-                            onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                            onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
+                            onMouseEnter={(e) =>
+                              (e.currentTarget.style.transform =
+                                "translateY(1px)")
+                            }
+                            onMouseLeave={(e) =>
+                              (e.currentTarget.style.transform =
+                                "translateY(0px)")
+                            }
                           >
                             Cancel
                           </button>
 
-                          {!user ? <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>Sign in to submit.</div> : null}
+                          {!user ? (
+                            <div
+                              style={{
+                                marginLeft: "auto",
+                                fontSize: 12,
+                                opacity: 0.8,
+                              }}
+                            >
+                              Sign in to submit.
+                            </div>
+                          ) : null}
                         </div>
 
-                        <div style={{ height: 2, background: "rgba(0,0,0,0.18)", marginTop: 12 }} />
+                        <div
+                          style={{
+                            height: 2,
+                            background: "rgba(0,0,0,0.18)",
+                            marginTop: 12,
+                          }}
+                        />
                       </div>
                     ) : null}
 
-                    {!collapseSuggestions && suggestionsByUid[p.pid]?.length ? (
-                      <div style={{ marginTop: 10, fontSize: 14 }} onClick={(e) => e.stopPropagation()}>
+                    {!collapseSuggestions && suggestionsByUid[l.uid]?.length ? (
+                      <div
+                        style={{ marginTop: 10, fontSize: 14 }}
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         <div
                           style={{
                             display: "flex",
@@ -3417,7 +5433,12 @@ useEffect(() => {
                         >
                           <button
                             type="button"
-                            onClick={() => setCollapsedUid((prev) => ({ ...prev, [p.pid]: !prev[p.pid] }))}
+                            onClick={() =>
+                              setCollapsedUid((prev) => ({
+                                ...prev,
+                                [l.uid]: !prev[l.uid],
+                              }))
+                            }
                             style={{
                               display: "inline-flex",
                               alignItems: "center",
@@ -3436,18 +5457,24 @@ useEffect(() => {
                             onFocus={blurOnFocus}
                           >
                             <span>Suggestions</span>
-                            <span style={{ fontSize: 12, opacity: 0.8 }}>{collapsedUid[p.pid] ? "▸" : "▾"}</span>
-                            <span style={{ fontSize: 12, opacity: 0.65 }}>({suggestionsByUid[p.pid].length})</span>
+                            <span style={{ fontSize: 12, opacity: 0.8 }}>
+                              {collapsedUid[l.uid] ? "▸" : "▾"}
+                            </span>
+                            <span style={{ fontSize: 12, opacity: 0.65 }}>
+                              ({suggestionsByUid[l.uid].length})
+                            </span>
                           </button>
 
-                          <div style={{ display: "flex", alignItems: "center" }}>
+                          <div
+                            style={{ display: "flex", alignItems: "center" }}
+                          >
                             <select
                               aria-label="Sort suggestions"
-                              value={sortModeByUid[p.pid] ?? "top"}
+                              value={sortModeByUid[l.uid] ?? "top"}
                               onChange={(e) =>
                                 setSortModeByUid((prev) => ({
                                   ...prev,
-                                  [p.pid]: e.target.value as "top" | "newest",
+                                  [l.uid]: e.target.value as "top" | "newest",
                                 }))
                               }
                               style={{
@@ -3467,8 +5494,8 @@ useEffect(() => {
                           </div>
                         </div>
 
-                        {!collapsedUid[p.pid] &&
-                          getSortedSuggestions(p.pid)
+                        {!collapsedUid[l.uid] &&
+                          getSortedSuggestions(l.uid)
                             .slice(0, 5)
                             .map((s) => (
                               <div
@@ -3490,13 +5517,35 @@ useEffect(() => {
                                     gap: 10,
                                   }}
                                 >
-                                  <div style={{ whiteSpace: "pre-wrap", flex: 1 }}>{s.suggested_text}</div>
-                                  <div style={{ fontSize: 13, opacity: 0.85, whiteSpace: "nowrap" }}>▲ {s.vote_count ?? 0}</div>
+                                  <div
+                                    style={{ whiteSpace: "pre-wrap", flex: 1 }}
+                                  >
+                                    {s.suggested_text}
+                                  </div>
+                                  <div
+                                    style={{
+                                      fontSize: 13,
+                                      opacity: 0.85,
+                                      whiteSpace: "nowrap",
+                                    }}
+                                  >
+                                    ▲ {s.vote_count ?? 0}
+                                  </div>
                                 </div>
 
                                 {s.comment ? (
-                                  <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
-                                    <span style={{ fontWeight: 700 }}>Note:</span> {s.comment}
+                                  <div
+                                    style={{
+                                      marginTop: 6,
+                                      fontSize: 12,
+                                      opacity: 0.85,
+                                      whiteSpace: "pre-wrap",
+                                    }}
+                                  >
+                                    <span style={{ fontWeight: 700 }}>
+                                      Note:
+                                    </span>{" "}
+                                    {s.comment}
                                   </div>
                                 ) : null}
 
@@ -3519,27 +5568,51 @@ useEffect(() => {
                                         whiteSpace: "nowrap",
                                       }}
                                     >
-                                      by {s.author_username || usernameByUserId[s.user_id] || `user:${s.user_id.slice(0, 8)}`} •{" "}
+                                      by{" "}
+                                      {s.author_username ||
+                                        usernameByUserId[s.user_id] ||
+                                        `user:${s.user_id.slice(0, 8)}`}{" "}
+                                      •{" "}
                                       {new Date(s.created_at).toLocaleString()}
                                     </div>
-                                    {!user ? <div style={{ marginTop: 4, fontSize: 12, opacity: 0.8 }}>Sign in to vote.</div> : null}
+                                    {!user ? (
+                                      <div
+                                        style={{
+                                          marginTop: 4,
+                                          fontSize: 12,
+                                          opacity: 0.8,
+                                        }}
+                                      >
+                                        Sign in to vote.
+                                      </div>
+                                    ) : null}
                                   </div>
 
                                   <button
                                     type="button"
                                     disabled={!user}
                                     onMouseEnter={() => setHoverVoteId(s.id)}
-                                    onMouseLeave={() => setHoverVoteId((cur) => (cur === s.id ? null : cur))}
+                                    onMouseLeave={() =>
+                                      setHoverVoteId((cur) =>
+                                        cur === s.id ? null : cur,
+                                      )
+                                    }
                                     onClick={() => upvoteSuggestion(s.id)}
                                     style={{
                                       padding: "6px 10px",
                                       fontSize: 12,
                                       borderRadius: 10,
                                       border: "1px solid rgba(0,0,0,0.18)",
-                                      background: !user ? "rgba(0,0,0,0.06)" : "white",
+                                      background: !user
+                                        ? "rgba(0,0,0,0.06)"
+                                        : "white",
                                       cursor: !user ? "not-allowed" : "pointer",
-                                      transition: "transform 120ms ease, box-shadow 120ms ease, background 120ms ease",
-                                      transform: hoverVoteId === s.id && user ? "translateY(1px)" : "translateY(0px)",
+                                      transition:
+                                        "transform 120ms ease, box-shadow 120ms ease, background 120ms ease",
+                                      transform:
+                                        hoverVoteId === s.id && user
+                                          ? "translateY(1px)"
+                                          : "translateY(0px)",
                                       boxShadow:
                                         hoverVoteId === s.id && user
                                           ? "inset 0 2px 4px rgba(0,0,0,0.18)"
@@ -3554,320 +5627,38 @@ useEffect(() => {
                               </div>
                             ))}
 
-                        {collapsedUid[p.pid] ? (
-                          <div style={{ marginTop: 4, opacity: 0.7, paddingLeft: 2 }}>Click “Suggestions” to expand.</div>
+                        {collapsedUid[l.uid] ? (
+                          <div
+                            style={{
+                              marginTop: 4,
+                              opacity: 0.7,
+                              paddingLeft: 2,
+                            }}
+                          >
+                            Click “Suggestions” to expand.
+                          </div>
                         ) : null}
                       </div>
                     ) : null}
                   </div>
-                );
-              })}
-            </div>
-          ) : (
-            <div style={{ opacity: 0.75, fontSize: 15 }}>No paragraph transcription available for this page.</div>
-          )
-        ) : (
-          <div style={{ fontSize: 16 }}>
-            {lines.map((l) => (
-              <div
-                key={l.uid}
-                ref={(el) => {
-                  lineElByIdRef.current[String(l.uid)] = el;
-                }}
-                onMouseEnter={() => {
-                  setActiveSource("right");
-                  setActiveId(l.uid);
-                  setActiveParagraphId(null);
-                  setActiveBox(boxByUidRef.current[l.uid] ?? null);
-                }}
-                onMouseLeave={() => {
-                  setActiveSource(null);
-                  setActiveId(null);
-                  setActiveBox(null);
-                }}
-                onClick={() => {
-                  setActiveSource("right");
-                  setActiveId(l.uid);
-                  setActiveParagraphId(null);
-                  setActiveBox(boxByUidRef.current[l.uid] ?? null);
-                }}
-                style={{
-                  padding: "10px 6px",
-                  borderRadius: 10,
-                  lineHeight: 1.3,
-                  fontSize: 15,
-                  cursor: "pointer",
-                  border: "1px solid rgba(0,0,0,0.06)",
-                  background: activeId === l.uid ? "rgba(255,242,168,0.75)" : "transparent",
-                  boxShadow: "none",
-                  fontFamily: "Georgia, 'Times New Roman', serif",
-                }}
-              >
-                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>{l.transcription}</div>
-                  <button
-                    type="button"
-                    aria-label="Suggest edit"
-                    title="Suggest edit"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (openSuggestUid === l.uid) {
-                        setOpenSuggestUid(null);
-                        setSuggestText("");
-                        setSuggestComment("");
-                      } else {
-                        setOpenSuggestUid(l.uid);
-                        setSuggestText(l.transcription);
-                        setSuggestComment("");
-                      }
-                    }}
-                    style={iconBtn}
-                    onMouseDown={preventMouseDownFocus}
-                    onFocus={blurOnFocus}
-                    onMouseEnter={(e) => {
-                      (e.currentTarget as HTMLButtonElement).style.background = "rgba(0,0,0,0.06)";
-                      (e.currentTarget as HTMLButtonElement).style.transform = "translateY(1px)";
-                    }}
-                    onMouseLeave={(e) => {
-                      (e.currentTarget as HTMLButtonElement).style.background = "transparent";
-                      (e.currentTarget as HTMLButtonElement).style.transform = "translateY(0px)";
-                    }}
-                  >
-                    <PencilGlyph size={16} />
-                  </button>
-                </div>
-
-                {openSuggestUid === l.uid ? (
-                  <div style={{ marginTop: 8 }} onClick={(e) => e.stopPropagation()}>
-                    <textarea
-                      value={suggestText}
-                      onChange={(e) => setSuggestText(e.target.value)}
-                      rows={3}
-                      style={{ width: "100%", padding: 8, borderRadius: 10, border: "1px solid rgba(0,0,0,0.15)" }}
-                    />
-                    <textarea
-                      value={suggestComment}
-                      onChange={(e) => setSuggestComment(e.target.value)}
-                      rows={2}
-                      placeholder="Optional note (why this edit?)"
-                      style={{
-                        width: "100%",
-                        padding: 8,
-                        borderRadius: 10,
-                        border: "1px solid rgba(0,0,0,0.15)",
-                        marginTop: 8,
-                      }}
-                    />
-                    <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
-                      <button
-                        type="button"
-                        onClick={() => submitSuggestion(l.uid, l.transcription)}
-                        style={btnBase}
-                        onMouseDown={preventMouseDownFocus}
-                        onFocus={blurOnFocus}
-                        onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                        onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
-                      >
-                        Submit
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setOpenSuggestUid(null);
-                          setSuggestText("");
-                          setSuggestComment("");
-                        }}
-                        style={btnBase}
-                        onMouseDown={preventMouseDownFocus}
-                        onFocus={blurOnFocus}
-                        onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                        onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
-                      >
-                        Cancel
-                      </button>
-
-                      {!user ? <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>Sign in to submit.</div> : null}
-                    </div>
-
-                    <div style={{ height: 2, background: "rgba(0,0,0,0.18)", marginTop: 12 }} />
-                  </div>
-                ) : null}
-
-                {!collapseSuggestions && suggestionsByUid[l.uid]?.length ? (
-                  <div style={{ marginTop: 10, fontSize: 14 }} onClick={(e) => e.stopPropagation()}>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 10,
-                        marginBottom: 6,
-                      }}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => setCollapsedUid((prev) => ({ ...prev, [l.uid]: !prev[l.uid] }))}
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 8,
-                          fontWeight: 800,
-                          padding: "6px 10px",
-                          borderRadius: 10,
-                          border: "1px solid rgba(0,0,0,0.12)",
-                          background: "white",
-                          cursor: "pointer",
-                          boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
-                          outline: "none",
-                          appearance: "none",
-                        }}
-                        onMouseDown={preventMouseDownFocus}
-                        onFocus={blurOnFocus}
-                      >
-                        <span>Suggestions</span>
-                        <span style={{ fontSize: 12, opacity: 0.8 }}>{collapsedUid[l.uid] ? "▸" : "▾"}</span>
-                        <span style={{ fontSize: 12, opacity: 0.65 }}>({suggestionsByUid[l.uid].length})</span>
-                      </button>
-
-                      <div style={{ display: "flex", alignItems: "center" }}>
-                        <select
-                          aria-label="Sort suggestions"
-                          value={sortModeByUid[l.uid] ?? "top"}
-                          onChange={(e) =>
-                            setSortModeByUid((prev) => ({
-                              ...prev,
-                              [l.uid]: e.target.value as "top" | "newest",
-                            }))
-                          }
-                          style={{
-                            padding: "6px 10px",
-                            borderRadius: 10,
-                            border: "1px solid rgba(0,0,0,0.12)",
-                            background: "white",
-                            fontSize: 12,
-                            fontWeight: 800,
-                            outline: "none",
-                            cursor: "pointer",
-                          }}
-                        >
-                          <option value="top">Upvotes</option>
-                          <option value="newest">Newest</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    {!collapsedUid[l.uid] &&
-                      getSortedSuggestions(l.uid)
-                        .slice(0, 5)
-                        .map((s) => (
-                          <div
-                            key={s.id}
-                            style={{
-                              padding: "6px 8px",
-                              border: "1px solid rgba(0,0,0,0.10)",
-                              borderRadius: 10,
-                              marginBottom: 6,
-                              fontSize: 14,
-                              background: "rgba(255,255,255,0.75)",
-                            }}
-                          >
-                            <div
-                              style={{
-                                display: "flex",
-                                justifyContent: "space-between",
-                                alignItems: "flex-start",
-                                gap: 10,
-                              }}
-                            >
-                              <div style={{ whiteSpace: "pre-wrap", flex: 1 }}>{s.suggested_text}</div>
-                              <div style={{ fontSize: 13, opacity: 0.85, whiteSpace: "nowrap" }}>▲ {s.vote_count ?? 0}</div>
-                            </div>
-
-                            {s.comment ? (
-                              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
-                                <span style={{ fontWeight: 700 }}>Note:</span> {s.comment}
-                              </div>
-                            ) : null}
-
-                            <div
-                              style={{
-                                display: "flex",
-                                justifyContent: "space-between",
-                                alignItems: "center",
-                                gap: 10,
-                                marginTop: 8,
-                              }}
-                            >
-                              <div style={{ minWidth: 0 }}>
-                                <div
-                                  style={{
-                                    fontSize: 13,
-                                    opacity: 0.75,
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    whiteSpace: "nowrap",
-                                  }}
-                                >
-                                  by {s.author_username || usernameByUserId[s.user_id] || `user:${s.user_id.slice(0, 8)}`} •{" "}
-                                  {new Date(s.created_at).toLocaleString()}
-                                </div>
-                                {!user ? <div style={{ marginTop: 4, fontSize: 12, opacity: 0.8 }}>Sign in to vote.</div> : null}
-                              </div>
-
-                              <button
-                                type="button"
-                                disabled={!user}
-                                onMouseEnter={() => setHoverVoteId(s.id)}
-                                onMouseLeave={() => setHoverVoteId((cur) => (cur === s.id ? null : cur))}
-                                onClick={() => upvoteSuggestion(s.id)}
-                                style={{
-                                  padding: "6px 10px",
-                                  fontSize: 12,
-                                  borderRadius: 10,
-                                  border: "1px solid rgba(0,0,0,0.18)",
-                                  background: !user ? "rgba(0,0,0,0.06)" : "white",
-                                  cursor: !user ? "not-allowed" : "pointer",
-                                  transition: "transform 120ms ease, box-shadow 120ms ease, background 120ms ease",
-                                  transform: hoverVoteId === s.id && user ? "translateY(1px)" : "translateY(0px)",
-                                  boxShadow:
-                                    hoverVoteId === s.id && user
-                                      ? "inset 0 2px 4px rgba(0,0,0,0.18)"
-                                      : "0 1px 2px rgba(0,0,0,0.10)",
-                                  opacity: !user ? 0.6 : 1,
-                                  whiteSpace: "nowrap",
-                                }}
-                              >
-                                Upvote
-                              </button>
-                            </div>
-                          </div>
-                        ))}
-
-                    {collapsedUid[l.uid] ? (
-                      <div style={{ marginTop: 4, opacity: 0.7, paddingLeft: 2 }}>Click “Suggestions” to expand.</div>
-                    ) : null}
-                  </div>
-                ) : null}
+                ))}
               </div>
-            ))}
+            )}
           </div>
-        )}
-      </div>
 
-           {/* Close the 2-panel grid before rendering overlays */}
-      </div>
+          {/* Close the 2-panel grid before rendering overlays */}
+        </div>
       )}
 
-      {/* LEADERBOARD MODAL OVERLAY (does not affect layout) */}
-      {showLeaderboard ? (
+      {/* ADD LOCATION MODAL OVERLAY */}
+      {showAddLocation ? (
         <div
-          {...backdropHandlers(() => setShowLeaderboard(false))}
+          {...backdropHandlers(() => setShowAddLocation(false))}
           style={{
             position: "fixed",
             inset: 0,
             background: "rgba(0,0,0,0.18)",
-            zIndex: 9999,
+            zIndex: 100000,
             display: "flex",
             justifyContent: "center",
             alignItems: "flex-start",
@@ -3885,10 +5676,192 @@ useEffect(() => {
               padding: 14,
               background: "rgba(255,255,255,0.98)",
               boxShadow: "0 18px 50px rgba(0,0,0,0.18)",
+              fontFamily: "ui-sans-serif, system-ui",
             }}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-              <div style={{ fontWeight: 900, fontSize: 16 }}>Community Leaderboard</div>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 10,
+              }}
+            >
+              <div style={{ fontWeight: 900, fontSize: 16 }}>
+                Add location for Page {pageKeyToNumber(pageKey) ?? ""}
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAddLocation(false)}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  background: "white",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  outline: "none",
+                  appearance: "none",
+                }}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
+              This location will be saved for{" "}
+              <b>Page {pageKeyToNumber(pageKey) ?? ""}</b> and will appear on
+              the map trail.
+            </div>
+
+            <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+              <input
+                value={locLabel}
+                onChange={(e) => setLocLabel(e.target.value)}
+                placeholder="Label (optional)"
+                style={{
+                  padding: "10px 12px",
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  borderRadius: 12,
+                }}
+              />
+
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 10,
+                }}
+              >
+                <input
+                  value={locLat}
+                  onChange={(e) => setLocLat(e.target.value)}
+                  placeholder="Latitude in Degrees (e.g. 45.5017)"
+                  style={{
+                    padding: "10px 12px",
+                    border: "1px solid rgba(0,0,0,0.15)",
+                    borderRadius: 12,
+                  }}
+                />
+                <input
+                  value={locLng}
+                  onChange={(e) => setLocLng(e.target.value)}
+                  placeholder="Longitude in Degrees (e.g. -73.5673)"
+                  style={{
+                    padding: "10px 12px",
+                    border: "1px solid rgba(0,0,0,0.15)",
+                    borderRadius: 12,
+                  }}
+                />
+              </div>
+
+              <textarea
+                value={locNote}
+                onChange={(e) => setLocNote(e.target.value)}
+                rows={3}
+                placeholder="Note (optional)"
+                style={{
+                  padding: "10px 12px",
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  borderRadius: 12,
+                  resize: "vertical",
+                }}
+              />
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                gap: 10,
+                marginTop: 12,
+                alignItems: "center",
+              }}
+            >
+              <button
+                type="button"
+                onClick={saveLocationForCurrentPage}
+                disabled={isSavingLocation}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  background: "white",
+                  cursor: isSavingLocation ? "not-allowed" : "pointer",
+                  fontWeight: 900,
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.10)",
+                  opacity: isSavingLocation ? 0.6 : 1,
+                }}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+              >
+                {isSavingLocation ? "Saving…" : "Save location"}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowAddLocation(false)}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.14)",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  color: "rgba(0,0,0,0.75)",
+                }}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* COMMUNITY LEADERBOARD MODAL */}
+      {showLeaderboard ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.18)",
+            zIndex: 100000,
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "flex-start",
+            paddingTop: 70,
+            paddingLeft: 16,
+            paddingRight: 16,
+          }}
+          onClick={() => setShowLeaderboard(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: "relative",
+              zIndex: 100001,
+              width: "min(720px, 92vw)",
+              borderRadius: 16,
+              background: "rgba(255,255,255,0.98)",
+              boxShadow: "0 18px 50px rgba(0,0,0,0.18)",
+              border: "1px solid rgba(0,0,0,0.12)",
+              padding: 14,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 10,
+              }}
+            >
+              <div style={{ fontWeight: 900, fontSize: 16 }}>
+                Community Leaderboard
+              </div>
               <button
                 type="button"
                 onClick={() => setShowLeaderboard(false)}
@@ -3909,9 +5882,14 @@ useEffect(() => {
               </button>
             </div>
 
+            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
+              Top contributors ranked by total upvotes received on their
+              suggestions.
+            </div>
+
             <div style={{ marginTop: 12 }}>
               {isLoadingLeaderboard ? (
-                <div style={{ fontSize: 13, opacity: 0.8 }}>Loading leaderboard…</div>
+                <div style={{ padding: 10, opacity: 0.75 }}>Loading…</div>
               ) : leaderboardRows.length ? (
                 <div style={{ display: "grid", gap: 8 }}>
                   {leaderboardRows.map((r, idx) => (
@@ -3926,11 +5904,32 @@ useEffect(() => {
                         borderRadius: 12,
                         border: "1px solid rgba(0,0,0,0.10)",
                         background: "white",
-                        boxShadow: "0 1px 2px rgba(0,0,0,0.06)",
                       }}
                     >
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                        <div style={{ width: 28, textAlign: "right", fontWeight: 900, opacity: 0.8 }}>#{idx + 1}</div>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 10,
+                          minWidth: 0,
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: 28,
+                            height: 28,
+                            borderRadius: 999,
+                            background: "rgba(0,0,0,0.08)",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            fontWeight: 900,
+                            fontSize: 12,
+                            flex: "0 0 auto",
+                          }}
+                        >
+                          {idx + 1}
+                        </div>
                         <div
                           style={{
                             fontWeight: 900,
@@ -3939,34 +5938,76 @@ useEffect(() => {
                             whiteSpace: "nowrap",
                           }}
                         >
-                          {r.username}
+                          {r.username ||
+                            `user:${String(r.user_id).slice(0, 8)}`}
                         </div>
                       </div>
-                      <div style={{ fontWeight: 900, opacity: 0.9 }}>▲ {r.upvotes}</div>
+                      <div style={{ fontWeight: 900, whiteSpace: "nowrap" }}>
+                        ▲ {Number(r.upvotes || 0).toLocaleString()}
+                      </div>
                     </div>
                   ))}
                 </div>
               ) : (
-                <div style={{ fontSize: 13, opacity: 0.8 }}>No votes yet.</div>
+                <div style={{ padding: 10, opacity: 0.75 }}>No votes yet.</div>
               )}
             </div>
 
-            <div style={{ marginTop: 12, fontSize: 12, opacity: 0.65 }}>
-              Ranked by total upvotes received on suggestions.
+            <div
+              style={{
+                display: "flex",
+                gap: 10,
+                marginTop: 14,
+                justifyContent: "flex-end",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => loadLeaderboard()}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  background: "white",
+                  cursor: "pointer",
+                  fontWeight: 900,
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.10)",
+                }}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+              >
+                Refresh
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowLeaderboard(false)}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.14)",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  color: "rgba(0,0,0,0.75)",
+                }}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>
       ) : null}
-
-      {/* SIGNIN MODAL OVERLAY (does not affect layout) */}
-      {!user && showSignin ? (
+      {/* SIGN IN MODAL OVERLAY */}
+      {showSignin ? (
         <div
           {...backdropHandlers(() => setShowSignin(false))}
           style={{
             position: "fixed",
             inset: 0,
             background: "rgba(0,0,0,0.18)",
-            zIndex: 9999,
+            zIndex: 100000,
             display: "flex",
             justifyContent: "center",
             alignItems: "flex-start",
@@ -3984,9 +6025,19 @@ useEffect(() => {
               padding: 14,
               background: "rgba(255,255,255,0.98)",
               boxShadow: "0 18px 50px rgba(0,0,0,0.18)",
+              fontFamily: "ui-sans-serif, system-ui",
+              position: "relative",
+              zIndex: 100001,
             }}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 10,
+              }}
+            >
               <div style={{ fontWeight: 900, fontSize: 16 }}>Sign in</div>
               <button
                 type="button"
@@ -4008,32 +6059,53 @@ useEffect(() => {
               </button>
             </div>
 
-            <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+            <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
               <input
                 value={signinId}
                 onChange={(e) => setSigninId(e.target.value)}
-                placeholder="username or email"
-                style={{ padding: "10px 12px", border: "1px solid rgba(0,0,0,0.15)", borderRadius: 12 }}
+                placeholder="Username or email"
+                style={{
+                  padding: "10px 12px",
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  borderRadius: 12,
+                }}
               />
-
               <input
+                type="password"
                 value={signinPw}
                 onChange={(e) => setSigninPw(e.target.value)}
-                placeholder="password"
-                type="password"
-                style={{ padding: "10px 12px", border: "1px solid rgba(0,0,0,0.15)", borderRadius: 12 }}
+                placeholder="Password"
+                style={{
+                  padding: "10px 12px",
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  borderRadius: 12,
+                }}
               />
             </div>
 
-            <div style={{ display: "flex", gap: 10, marginTop: 12, alignItems: "center" }}>
+            <div
+              style={{
+                display: "flex",
+                gap: 10,
+                marginTop: 12,
+                alignItems: "center",
+                flexWrap: "wrap",
+              }}
+            >
               <button
                 type="button"
                 onClick={signIn}
-                style={btnBase}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  background: "white",
+                  cursor: "pointer",
+                  fontWeight: 900,
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.10)",
+                }}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
               >
                 Sign in
               </button>
@@ -4042,19 +6114,39 @@ useEffect(() => {
                 type="button"
                 onClick={() => {
                   setShowSignin(false);
-                  if (signinId.trim().includes("@")) setSignupEmail(signinId.trim());
                   setShowSignup(true);
                 }}
-                style={btnBase}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.14)",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  color: "rgba(0,0,0,0.75)",
+                }}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
               >
                 Create account
               </button>
 
-              <button type="button" onClick={forgotPassword} style={btnLink}>
+              <button
+                type="button"
+                onClick={forgotPassword}
+                style={{
+                  padding: 0,
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  color: "rgba(0,0,0,0.65)",
+                  textDecoration: "underline",
+                  marginLeft: "auto",
+                }}
+                onMouseDown={preventMouseDownFocus}
+                onFocus={blurOnFocus}
+              >
                 Forgot password?
               </button>
             </div>
@@ -4062,15 +6154,15 @@ useEffect(() => {
         </div>
       ) : null}
 
-      {/* SIGNUP MODAL OVERLAY (does not affect layout) */}
-      {!user && showSignup ? (
+      {/* SIGN UP MODAL OVERLAY */}
+      {showSignup ? (
         <div
           {...backdropHandlers(() => setShowSignup(false))}
           style={{
             position: "fixed",
             inset: 0,
             background: "rgba(0,0,0,0.18)",
-            zIndex: 9999,
+            zIndex: 100000,
             display: "flex",
             justifyContent: "center",
             alignItems: "flex-start",
@@ -4088,10 +6180,22 @@ useEffect(() => {
               padding: 14,
               background: "rgba(255,255,255,0.98)",
               boxShadow: "0 18px 50px rgba(0,0,0,0.18)",
+              fontFamily: "ui-sans-serif, system-ui",
+              position: "relative",
+              zIndex: 100001,
             }}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-              <div style={{ fontWeight: 900, fontSize: 16 }}>Create an account</div>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 10,
+              }}
+            >
+              <div style={{ fontWeight: 900, fontSize: 16 }}>
+                Create account
+              </div>
               <button
                 type="button"
                 onClick={() => setShowSignup(false)}
@@ -4112,56 +6216,87 @@ useEffect(() => {
               </button>
             </div>
 
-            <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+            <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
               <input
                 value={signupEmail}
                 onChange={(e) => setSignupEmail(e.target.value)}
-                placeholder="email"
-                style={{ padding: "10px 12px", border: "1px solid rgba(0,0,0,0.15)", borderRadius: 12 }}
+                placeholder="Email"
+                style={{
+                  padding: "10px 12px",
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  borderRadius: 12,
+                }}
               />
-
               <input
                 value={signupUsername}
                 onChange={(e) => setSignupUsername(e.target.value)}
-                placeholder="username (public)"
-                style={{ padding: "10px 12px", border: "1px solid rgba(0,0,0,0.15)", borderRadius: 12 }}
+                placeholder="Username"
+                style={{
+                  padding: "10px 12px",
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  borderRadius: 12,
+                }}
               />
-
               <input
+                type="password"
                 value={signupPw}
                 onChange={(e) => setSignupPw(e.target.value)}
-                placeholder="password"
-                type="password"
-                style={{ padding: "10px 12px", border: "1px solid rgba(0,0,0,0.15)", borderRadius: 12 }}
+                placeholder="Password"
+                style={{
+                  padding: "10px 12px",
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  borderRadius: 12,
+                }}
               />
             </div>
 
-            <div style={{ display: "flex", gap: 10, marginTop: 12, alignItems: "center" }}>
+            <div
+              style={{
+                display: "flex",
+                gap: 10,
+                marginTop: 12,
+                alignItems: "center",
+                flexWrap: "wrap",
+              }}
+            >
               <button
                 type="button"
                 onClick={signUp}
-                style={btnBase}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  background: "white",
+                  cursor: "pointer",
+                  fontWeight: 900,
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.10)",
+                }}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "translateY(1px)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "translateY(0px)")}
               >
-                Create account
+                Sign up
               </button>
 
               <button
                 type="button"
-                onClick={() => setShowSignup(false)}
-                style={btnSecondary}
+                onClick={() => {
+                  setShowSignup(false);
+                  setShowSignin(true);
+                }}
+                style={{
+                  padding: "8px 14px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.14)",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  color: "rgba(0,0,0,0.75)",
+                }}
                 onMouseDown={preventMouseDownFocus}
                 onFocus={blurOnFocus}
-                onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(0,0,0,0.03)")}
-                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
               >
-                Cancel
+                Back to sign in
               </button>
-
-              <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.8 }}>Username is shown publicly.</div>
             </div>
           </div>
         </div>
