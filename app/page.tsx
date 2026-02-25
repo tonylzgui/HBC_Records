@@ -780,13 +780,15 @@ export default function Home() {
           }
         }
 
+        if (!nb) continue;
+
         out.push({
           pageKey: pk,
           pageNum,
           label: "Paragraph",
           confPct: c * 100,
           targetPid: pid,
-          box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+          box: { x: nb.x, y: nb.y, w: nb.w, h: nb.h },
         });
       }
 
@@ -847,13 +849,15 @@ export default function Home() {
           }
         }
 
+        if (!nb) continue;
+
         out.push({
           pageKey: pk,
           pageNum,
           label: "List",
           confPct: c * 100,
           targetPid: pid,
-          box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+          box: { x: nb.x, y: nb.y, w: nb.w, h: nb.h },
         });
       }
 
@@ -916,13 +920,15 @@ export default function Home() {
           }
         }
 
+        if (!nb) continue;
+
         out.push({
           pageKey: pk,
           pageNum,
           label: "Table",
           confPct: c * 100,
           targetPid: pid,
-          box: nb ? { x: nb.x, y: nb.y, w: nb.w, h: nb.h } : null,
+          box: { x: nb.x, y: nb.y, w: nb.w, h: nb.h },
         });
       }
     }
